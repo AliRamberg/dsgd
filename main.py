@@ -15,10 +15,10 @@ Prereqs (Python 3.9+):
     pip install ray torch
 
 Run examples:
-    python try1.py --mode ssgd --num-workers 4 --steps 500
-    python try1.py --mode asgd --num-workers 4 --steps 500
-    python try1.py --mode ssp  --num-workers 4 --steps 500 --ssp-staleness 2
-    python try1.py --mode localsgd --num-workers 4 --steps 500 --local-k 5
+    python try1.py --mode ssgd --num-workers 4 --total-updates 500
+    python try1.py --mode asgd --num-workers 4 --total-updates 500
+    python try1.py --mode ssp  --num-workers 4 --total-updates 500 --ssp-staleness 2
+    python try1.py --mode localsgd --num-workers 4 --total-updates 500 --local-k 5
 
 
 Notes:
@@ -266,14 +266,14 @@ class ASGDParameterServer:
         self.w.grad = grad.to(self.device)
         self.optimizer.step()
         self.num_updates += 1
-        
+
         # Periodic evaluation
         if self.X_full is not None and self.y_full is not None:
             if self.num_updates % self.eval_every == 0 or self.num_updates == 1:
                 with torch.no_grad():
                     loss = float(F.binary_cross_entropy_with_logits(self.X_full @ self.w, self.y_full))
                 self.loss_history.append((self.num_updates, loss))
-        
+
         # return current model version index
         return self.num_updates
 
@@ -317,12 +317,14 @@ class ASGDWorker:
             s = max(0, ver - 1)
 
             # Collect metrics data (will be recorded by main loop)
-            metrics_data.append({
-                "step": ver,
-                "iter": i,
-                "latency_ms": iter_time * 1000,
-                "staleness": s,
-            })
+            metrics_data.append(
+                {
+                    "step": ver,
+                    "iter": i,
+                    "latency_ms": iter_time * 1000,
+                    "staleness": s,
+                }
+            )
 
         return {
             "worker": self.id,
@@ -394,14 +396,14 @@ class SSPController:
         self.w.grad = grad.to(self.device)
         self.optimizer.step()
         self.global_updates += 1
-        
+
         # Periodic evaluation
         if self.X_full is not None and self.y_full is not None:
             if self.global_updates % self.eval_every == 0 or self.global_updates == 1:
                 with torch.no_grad():
                     loss = float(F.binary_cross_entropy_with_logits(self.X_full @ self.w, self.y_full))
                 self.loss_history.append((self.global_updates, loss))
-        
+
         # Mark this step as COMPLETED after gradient is applied
         self.worker_steps[wid] = step_i
         logger.debug(f"SSP: Worker {wid} completed step {step_i}, global_updates now {self.global_updates}")
@@ -452,12 +454,14 @@ class SSPWorker:
             self.local_step += 1
 
             # Collect metrics data (will be recorded by main loop)
-            metrics_data.append({
-                "step": ver,
-                "iter": i,
-                "latency_ms": iter_time * 1000,
-                "staleness": staleness,
-            })
+            metrics_data.append(
+                {
+                    "step": ver,
+                    "iter": i,
+                    "latency_ms": iter_time * 1000,
+                    "staleness": staleness,
+                }
+            )
 
         return {
             "worker": self.id,
@@ -538,26 +542,26 @@ def run_ssgd_centralized(
     """
     if metrics:
         metrics.start_training()
-    
+
     num_workers = len(shards)
     grad_size_bytes = cfg.d * 4  # float32 = 4 bytes
     # Communication: workers -> coordinator (gradients) + coordinator -> workers (weights)
     # For centralized: 2 * num_workers * grad_size per update
     comm_bytes_per_update = 2 * num_workers * grad_size_bytes
-    
+
     coord = SSGDCoordinator.remote(cfg.d, cfg.lr, cfg.device)
     workers = [SSGDWorker.remote(i, coord, shards[i], cfg) for i in range(num_workers)]
 
     for t in range(cfg.total_updates):
         grads = ray.get([w.step_once.remote() for w in workers])
         w_new, step = ray.get(coord.aggregate_and_step.remote(grads))
-        
+
         # Evaluate and record loss
         should_eval = (t % cfg.eval_every == 0) or (t == cfg.total_updates - 1)
         if should_eval:
             loss = float(F.binary_cross_entropy_with_logits(X_full @ w_new, y_full))
             print(f"[SSGD-Centralized] step={step:4d} loss={loss:.5f}")
-            
+
             if metrics:
                 # Count communication for all updates since last eval
                 steps_since_last_eval = cfg.eval_every if t > 0 else (t + 1)
@@ -565,7 +569,7 @@ def run_ssgd_centralized(
                     steps_since_last_eval = t % cfg.eval_every + 1
                 comm_bytes = comm_bytes_per_update * steps_since_last_eval
                 metrics.record_round(step, loss, comm_bytes=comm_bytes)
-    
+
     if metrics:
         metrics.stop_training()
         # Record final if not already recorded
@@ -588,13 +592,13 @@ def run_ssgd_allreduce(
     """
     if metrics:
         metrics.start_training()
-    
+
     num_workers = len(shards)
     grad_size_bytes = cfg.d * 4  # float32 = 4 bytes
     # AllReduce: Ring algorithm sends 2 * (N-1) / N * grad_size per worker
     # Total communication: 2 * (num_workers - 1) * grad_size_bytes
     comm_bytes_per_update = 2 * (num_workers - 1) * grad_size_bytes
-    
+
     orch = AllReduceOrchestrator.remote()
     workers = [SSGDAllReduceWorker.remote(i, shards[i], cfg) for i in range(len(shards))]
 
@@ -614,7 +618,7 @@ def run_ssgd_allreduce(
             w = ray.get(workers[0].get_weights.remote())
             loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
             print(f"[SSGD-AllReduce] step={t+1:4d} loss={loss:.5f}")
-            
+
             if metrics:
                 # Count communication for all updates since last eval
                 if t == 0:
@@ -625,7 +629,7 @@ def run_ssgd_allreduce(
                     steps_since_last_eval = cfg.eval_every
                 comm_bytes = comm_bytes_per_update * steps_since_last_eval
                 metrics.record_round(t + 1, loss, comm_bytes=comm_bytes)
-    
+
     if metrics:
         metrics.stop_training()
         # Record final if not already recorded
@@ -664,22 +668,22 @@ def run_asgd(
     """
     if metrics:
         metrics.start_training()
-    
+
     num_workers = len(shards)
     grad_size_bytes = cfg.d * 4  # float32 = 4 bytes
     # Communication: each worker push is grad_size_bytes
     comm_bytes_per_update = grad_size_bytes
-    
+
     ps = ASGDParameterServer.remote(cfg.d, cfg.lr, cfg.device, eval_every=cfg.eval_every)
     # Set full dataset for periodic evaluation
     ray.get(ps.set_full_dataset.remote(X_full.to("cpu"), y_full.to("cpu")))
     workers = [ASGDWorker.remote(i, ps, shards[i], cfg) for i in range(len(shards))]
 
     steps_per_worker = cfg.total_updates // num_workers
-    
+
     # Run workers and collect stats
     stats = ray.get([w.loop.remote(steps_per_worker) for w in workers])
-    
+
     # Record iteration metrics
     if metrics:
         for worker_stat in stats:
@@ -692,29 +696,29 @@ def run_asgd(
                     staleness=m["staleness"],
                     comm_bytes=comm_bytes_per_update,
                 )
-        
+
         # Periodic loss evaluation - evaluate on full dataset periodically
         final_updates = ray.get(ps.get_num_updates.remote())
         w = ray.get(ps.get_weights.remote())
-        
+
         # Evaluate loss periodically during training (evaluate from parameter server's history if available)
         loss_history = ray.get(ps.get_loss_history.remote())
         if loss_history:
             for update_count, loss in loss_history:
                 metrics.record_loss(update_count, loss, comm_bytes=0)
-        
+
         # Final evaluation
         final_loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
         metrics.record_final(final_updates, final_loss, final_updates)
         metrics.stop_training()
-        
+
         print(f"[ASGD] updates={final_updates} loss={final_loss:.5f}")
     else:
         w = ray.get(ps.get_weights.remote())
         loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
         final_updates = ray.get(ps.get_num_updates.remote())
         print(f"[ASGD] updates={final_updates} loss={loss:.5f}")
-    
+
     for s in stats:
         avg_staleness = float(np.mean([m["staleness"] for m in s["metrics_data"]]))
         print(f"  worker {s['worker']}: steps={s['local_steps']} avg_staleness≈{avg_staleness:.2f}")
@@ -735,12 +739,12 @@ def run_ssp(
     """
     if metrics:
         metrics.start_training()
-    
+
     num_workers = len(shards)
     grad_size_bytes = cfg.d * 4  # float32 = 4 bytes
     # Communication: each worker push is grad_size_bytes
     comm_bytes_per_update = grad_size_bytes
-    
+
     logger.debug(f"SSP: Starting training with staleness bound s={ssp_s}, {num_workers} workers")
     ctrl = SSPController.remote(cfg.d, cfg.lr, cfg.device, staleness=ssp_s, eval_every=cfg.eval_every)
     # Set full dataset for periodic evaluation
@@ -754,7 +758,7 @@ def run_ssp(
     steps_per_worker = cfg.total_updates // num_workers
     logger.debug(f"SSP: Each worker will run {steps_per_worker} iterations")
     stats = ray.get([w.loop.remote(steps_per_worker) for w in workers])
-    
+
     # Record iteration metrics
     if metrics:
         for worker_stat in stats:
@@ -767,19 +771,19 @@ def run_ssp(
                     staleness=m["staleness"],
                     comm_bytes=comm_bytes_per_update,
                 )
-        
+
         # Periodic loss evaluation using controller's loss_history
         loss_history = ray.get(ctrl.get_loss_history.remote())
         if loss_history:
             for update_count, loss in loss_history:
                 metrics.record_loss(update_count, loss, comm_bytes=0)
-        
+
         # Final evaluation
         w, ver = ray.get(ctrl.get_weights.remote())
         final_loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
         metrics.record_final(ver, final_loss, ver)
         metrics.stop_training()
-        
+
         logger.debug(f"SSP: Training complete, final version={ver}, loss={final_loss:.5f}")
         print(f"[SSP s={ssp_s}] updates={ver} loss={final_loss:.5f}")
     else:
@@ -787,7 +791,7 @@ def run_ssp(
         loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
         logger.debug(f"SSP: Training complete, final version={ver}, loss={loss:.5f}")
         print(f"[SSP s={ssp_s}] updates={ver} loss={loss:.5f}")
-    
+
     for s in stats:
         avg_staleness = float(np.mean([m["staleness"] for m in s["metrics_data"]]))
         print(f"  worker {s['worker']}: steps={s['local_steps']} avg_staleness≈{avg_staleness:.2f}")
@@ -809,13 +813,13 @@ def run_localsgd(
     """
     if metrics:
         metrics.start_training()
-    
+
     num_workers = len(shards)
     param_size_bytes = cfg.d * 4  # float32 = 4 bytes
     # Communication: all workers send weights, then receive averaged weights
     # Each sync round: num_workers * param_size (send) + num_workers * param_size (receive)
     comm_bytes_per_round = 2 * num_workers * param_size_bytes
-    
+
     avg = LocalAverager.remote(cfg.d)
     workers = [LocalWorker.remote(i, shards[i], cfg) for i in range(len(shards))]
 
@@ -828,14 +832,14 @@ def run_localsgd(
         w_global = ray.get(avg.average_and_broadcast.remote(local_ws))
         for w in workers:
             w.set_weights.remote(w_global)
-        
+
         # Evaluate and record loss
         step = (r + 1) * K  # Approximate global step
         should_eval = (r % 2 == 0) or (r == num_rounds - 1)
         if should_eval:
             loss = float(F.binary_cross_entropy_with_logits(X_full @ w_global, y_full))
             print(f"[LocalSGD K={K}] round={r:3d} updates≈{step:4d} loss={loss:.5f}")
-            
+
             if metrics:
                 # Count communication for this round (and previous rounds if eval_every > 1)
                 rounds_since_last_eval = 2 if r > 0 else (r + 1)
@@ -843,7 +847,7 @@ def run_localsgd(
                     rounds_since_last_eval = r % 2 + 1
                 comm_bytes = comm_bytes_per_round * rounds_since_last_eval
                 metrics.record_round(step, loss, comm_bytes=comm_bytes)
-    
+
     if metrics:
         metrics.stop_training()
         # Record final if not already recorded
@@ -925,20 +929,20 @@ def main():
     import json
     from datetime import datetime
     from pathlib import Path
-    
+
     run_id = args.run_name
     if not run_id:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_id = f"{timestamp}-{args.mode}-w{args.num_workers}-d{args.dim}-u{args.total_updates}-s{args.seed}"
-    
+
     outdir = Path(args.outdir)
     run_dir = outdir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    
+
     metrics = None
     if not args.no_logging:
         metrics = MetricsCollector(mode=args.mode, run_id=run_id)
-    
+
     # Save config
     config_dict = {
         "mode": args.mode,
@@ -963,10 +967,11 @@ def main():
     }
     with open(run_dir / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)
-    
+
     # Save metadata
     import socket
     import torch as torch_module
+
     meta_dict = {
         "run_id": run_id,
         "mode": args.mode,
@@ -978,13 +983,14 @@ def main():
     }
     try:
         import ray as ray_module
+
         meta_dict["ray_version"] = ray_module.__version__
     except:
         pass
-    
+
     with open(run_dir / "meta.json", "w") as f:
         json.dump(meta_dict, f, indent=2)
-    
+
     # Run training
     t0 = time.time()
     if args.mode == "ssgd":
@@ -997,7 +1003,7 @@ def main():
         run_localsgd(cfg, shards, X, y, args.local_k, metrics=metrics)
     dt = time.time() - t0
     print(f"Elapsed: {dt:.2f}s")
-    
+
     # Write metrics
     if metrics:
         metrics.write_jsonl(run_dir / "events.jsonl")
