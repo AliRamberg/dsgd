@@ -242,16 +242,48 @@ def plot_staleness_analysis(runs: list[dict], outdir: Path):
         ax_dist.legend(fontsize=9)
         ax_dist.grid(True, alpha=0.3)
 
-        # Bottom plot: staleness over time (per worker)
+        # Bottom plot: overall max staleness at each evaluation step (epoch)
         ax_ts = axes[1][idx]
-        if "worker_id" in iter_df.columns:
-            for worker_id in sorted(iter_df["worker_id"].dropna().unique()):
-                worker_df = iter_df[iter_df["worker_id"] == worker_id].sort_values("step")
-                ax_ts.plot(worker_df["step"], worker_df["staleness"], label=f"Worker {int(worker_id)}", alpha=0.7, linewidth=1.5)
 
-        ax_ts.set_xlabel("Step", fontsize=11)
-        ax_ts.set_ylabel("Staleness", fontsize=11)
-        ax_ts.set_title(f"{title}: Staleness Over Time", fontsize=12, fontweight="bold")
+        # Get evaluation steps (where loss is recorded) - these are the "epochs"
+        loss_df = df[df["event_type"].isin(["loss", "round", "final"])].copy()
+        if loss_df.empty:
+            print(f"⚠️  No loss evaluation events found for {mode}")
+            continue
+
+        eval_steps = sorted(loss_df["step"].unique())
+
+        # Calculate maximum staleness at each evaluation step
+        max_staleness_values = []
+        eval_steps_plot = []
+
+        prev_eval_step = 0
+        for eval_step in eval_steps:
+            # Get iterations between previous evaluation and current evaluation
+            # This gives us the staleness status at this epoch
+            iterations_in_epoch = iter_df[(iter_df["step"] > prev_eval_step) & (iter_df["step"] <= eval_step)]
+
+            # If no iterations in this epoch, try to get iterations at or before this step
+            if iterations_in_epoch.empty:
+                iterations_in_epoch = iter_df[iter_df["step"] <= eval_step]
+
+            if not iterations_in_epoch.empty and iterations_in_epoch["staleness"].notna().any():
+                # Calculate maximum staleness across all workers in this epoch
+                max_staleness = iterations_in_epoch["staleness"].max()
+                max_staleness_values.append(max_staleness)
+                eval_steps_plot.append(eval_step)
+
+            prev_eval_step = eval_step
+
+        if eval_steps_plot:
+            # Plot only the maximum staleness line
+            ax_ts.plot(
+                eval_steps_plot, max_staleness_values, marker="o", label="Max Staleness", linewidth=2, markersize=6, color="steelblue"
+            )
+
+        ax_ts.set_xlabel("Evaluation Step (Epoch)", fontsize=11)
+        ax_ts.set_ylabel("Max Staleness", fontsize=11)
+        ax_ts.set_title(f"{title}: Overall Max Staleness Over Time", fontsize=12, fontweight="bold")
         ax_ts.legend(fontsize=9)
         ax_ts.grid(True, alpha=0.3)
 
@@ -303,7 +335,7 @@ def plot_communication_bytes(runs: list[dict], outdir: Path):
             sync = config.get("sync_method", "centralized")
             # For SSGD, comm_bytes is per round
             avg_bytes_per_round = comm_events["comm_bytes"].mean()
-            # Per update: divide by eval_every (assuming comm is counted over eval_every steps)
+            # Per update: divide by _every (assuming comm is counted over eval_every steps)
             eval_every = config.get("eval_every", 5)
             avg_bytes_per_update = avg_bytes_per_round / eval_every
             labels.append(f"SSGD-{sync}{duration_str}")
