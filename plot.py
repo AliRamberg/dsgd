@@ -311,6 +311,8 @@ def plot_communication_bytes(runs: list[dict], outdir: Path):
 
     for run in runs:
         df = run["events"]
+        if 'comm_bytes' not in df.columns:
+            df['comm_bytes'] = 0
         config = run["config"]
         mode = config["mode"]
 

@@ -1,24 +1,25 @@
 # distributed_sgd_showcase.py
 """
 Distributed SGD showcase for four training modes on a single machine (CPU or a single GPU):
-  1) SSGD (Synchronous SGD with per-step averaging)
-  2) ASGD (Async SGD via parameter server)
-  3) SSP  (Stale Synchronous Parallel with staleness bound s)
-  4) LocalSGD (K local steps then synchronize parameters)
+  1) SSGD (Synchronous SGD using Ray Train TorchTrainer)
+  2) ASGD (Async SGD via parameter server - custom Ray Actors implementation)
+  3) SSP  (Stale Synchronous Parallel with staleness bound s - custom Ray Actors)
+  4) LocalSGD (K local steps then synchronize parameters - custom Ray Actors)
 
 Why this file?
 - Let you *see* differences in utilization, staleness, and convergence without a GPU cluster.
-- Uses Ray Actors to emulate parameter servers / coordinators and workers.
+- SSGD uses Ray Train for production-ready distributed training (handles NCCL/Gloo automatically).
+- ASGD/SSP/LocalSGD use custom Ray Actors to demonstrate alternative synchronization patterns.
 - Simulates heterogeneity (stragglers) with sleep delays (disabled by default).
 
 Prereqs (Python 3.9+):
     pip install ray torch
 
 Run examples:
-    python try1.py --mode ssgd --num-workers 4 --total-updates 500
-    python try1.py --mode asgd --num-workers 4 --total-updates 500
-    python try1.py --mode ssp  --num-workers 4 --total-updates 500 --ssp-staleness 2
-    python try1.py --mode localsgd --num-workers 4 --total-updates 500 --local-k 5
+    python main.py --mode ssgd --num-workers 4 --total-updates 500
+    python main.py --mode asgd --num-workers 4 --total-updates 500
+    python main.py --mode ssp  --num-workers 4 --total-updates 500 --ssp-staleness 2
+    python main.py --mode localsgd --num-workers 4 --total-updates 500 --local-k 5
 
 
 Notes:
@@ -26,6 +27,7 @@ Notes:
 - Adam optimizer for better convergence than plain SGD
 - Heterogeneity disabled by default; enable with --hetero-straggler-every N
 - Works on CPU by default; use --device cuda for GPU
+- SSGD automatically uses NCCL for GPU or Gloo for CPU (handled by Ray Train)
 """
 
 from __future__ import annotations
@@ -39,12 +41,45 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 import ray
+import ray.train
+from ray.train import ScalingConfig, RunConfig
+from ray.train.torch import TorchTrainer
+import tempfile
+import os
 
 from logger import logger
 from metrics import MetricsCollector
 
 # --------------------------- Utils ---------------------------
+
+
+def setup_actor_logging():
+    """Configure logging for Ray actors (they run in separate processes).
+
+    Ray actors run in separate processes. When we import logger from logger.py
+    in an actor, the module-level configuration should execute, but we ensure
+    it's properly set up by reconfiguring if needed (to handle any edge cases
+    with Ray's process isolation).
+    """
+    # Import logger - this should execute the module-level config in logger.py
+    from logger import logger as actor_logger
+
+    # Ensure logger is configured (in case module-level code didn't run properly)
+    # Clear handlers first to avoid duplicates
+    if not actor_logger.handlers:
+        import logging
+        import sys
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)-8s %(message)s', datefmt='%H:%M:%S')
+        handler.setFormatter(formatter)
+        actor_logger.addHandler(handler)
+        actor_logger.setLevel(logging.DEBUG)
+
+    return actor_logger
 
 
 def get_collective_backend(device: str) -> str:
@@ -60,24 +95,46 @@ def set_seed(seed: int = 1337):
     torch.manual_seed(seed)
 
 
-def make_synthetic_data(n: int, d: int, noise: float = 0.1, seed: int = 0):
-    """Non-convex classification with polynomial features to enable XOR learning"""
-    gen = torch.Generator().manual_seed(seed)
-    X_raw = torch.randn(n, d, generator=gen)
+class SyntheticDataset(Dataset):
+    """PyTorch Dataset for synthetic XOR classification data with polynomial features
 
-    # XOR pattern on first 2 dimensions
-    y = ((X_raw[:, 0] > 0).long() ^ (X_raw[:, 1] > 0).long()).float()
+    This Dataset can be used with PyTorch DataLoader and Ray Train's data loading utilities.
+    All data is generated upfront for reproducibility and performance.
+    """
 
-    # Add label noise
-    flip = torch.rand(n, generator=gen) < noise
-    y[flip] = 1 - y[flip]
+    def __init__(self, n: int, d: int, noise: float = 0.1, seed: int = 0):
+        """
+        Args:
+            n: Number of samples
+            d: Base feature dimension (will be expanded to d+3 with polynomial features)
+            noise: Label noise probability (default: 0.1)
+            seed: Random seed for reproducibility
+        """
+        self.n = n
+        self.d = d
 
-    # Add polynomial features: [x, x^2, x1*x2] to make XOR linearly separable
-    X_poly = torch.cat(
-        [X_raw, X_raw[:, :2] ** 2, (X_raw[:, 0:1] * X_raw[:, 1:2])], dim=1  # quadratic terms  # interaction term (key for XOR)
-    )
+        # Generate all data upfront
+        gen = torch.Generator().manual_seed(seed)
+        X_raw = torch.randn(n, d, generator=gen)
 
-    return X_poly, y
+        # XOR pattern on first 2 dimensions
+        y = ((X_raw[:, 0] > 0).long() ^ (X_raw[:, 1] > 0).long()).float()
+
+        # Add label noise
+        flip = torch.rand(n, generator=gen) < noise
+        y[flip] = 1 - y[flip]
+
+        # Add polynomial features: [x, x^2, x1*x2] to make XOR linearly separable
+        self.X = torch.cat(
+            [X_raw, X_raw[:, :2] ** 2, (X_raw[:, 0:1] * X_raw[:, 1:2])], dim=1  # quadratic terms  # interaction term (key for XOR)
+        )
+        self.y = y
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
 
 def grad_bce(X: torch.Tensor, w: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -128,6 +185,8 @@ class TrainConfig:
 
 @ray.remote
 class DatasetShard:
+    """Legacy DatasetShard for custom algorithms (ASGD/SSP/LocalSGD)"""
+
     def __init__(self, X: torch.Tensor, y: torch.Tensor, device: str):
         self.X = X.to(device)
         self.y = y.to(device)
@@ -139,97 +198,8 @@ class DatasetShard:
         return self.X[idx], self.y[idx]
 
 
-# --------------- SSGD: synchronous, per-step gradient average ---------------
-
-
-@ray.remote
-class SSGDCoordinator:
-    def __init__(self, d: int, lr: float, device: str):
-        self.w = torch.zeros(d, device=device, requires_grad=True)
-        self.optimizer = torch.optim.Adam([self.w], lr=lr)
-        self.device = device
-        self.step = 0
-
-    def get_weights(self):
-        return self.w.detach().cpu()
-
-    def aggregate_and_step(self, grads: list[torch.Tensor]):
-        g = torch.stack(grads, dim=0).mean(dim=0).to(self.device)
-        self.optimizer.zero_grad()
-        self.w.grad = g
-        self.optimizer.step()
-        self.step += 1
-        return self.w.detach().cpu(), self.step
-
-
-@ray.remote
-class SSGDWorker:
-    def __init__(self, worker_id: int, coord: SSGDCoordinator, shard: DatasetShard, cfg: TrainConfig):
-        self.id = worker_id
-        self.coord = coord
-        self.ds = shard
-        self.cfg = cfg
-
-    def step_once(self):
-        # pull weights
-        w = ray.get(self.coord.get_weights.remote()).to(self.cfg.device)
-        X, y = ray.get(self.ds.sample_batch.remote(self.cfg.batch))
-        sleep_heterogeneity(
-            self.id,
-            self.cfg.hetero_base,
-            self.cfg.hetero_jitter,
-            self.cfg.hetero_straggler_every,
-        )
-        g = grad_bce(X, w, y).cpu()
-        return g
-
-
-# --------------- SSGD AllReduce: decentralized gradient averaging ---------------
-
-
-@ray.remote
-class AllReduceOrchestrator:
-    """Orchestrates AllReduce communication (gather-reduce-broadcast pattern)"""
-
-    def allreduce_grads(self, grads: list[torch.Tensor]) -> torch.Tensor:
-        """Average gradients across all workers"""
-        return torch.stack(grads, dim=0).mean(dim=0)
-
-
-@ray.remote
-class SSGDAllReduceWorker:
-    """SSGD worker that maintains local weights and applies AllReduce gradients"""
-
-    def __init__(self, worker_id: int, shard: DatasetShard, cfg: TrainConfig):
-        self.id = worker_id
-        self.ds = shard
-        self.cfg = cfg
-        # Each worker has its own copy of weights
-        self.w = torch.zeros(cfg.d, device=cfg.device, requires_grad=True)
-        self.optimizer = torch.optim.Adam([self.w], lr=cfg.lr)
-
-    def get_weights(self):
-        """Return current weights (for evaluation)"""
-        return self.w.detach().cpu()
-
-    def compute_grad(self):
-        """Compute gradient on local batch"""
-        X, y = ray.get(self.ds.sample_batch.remote(self.cfg.batch))
-        sleep_heterogeneity(
-            self.id,
-            self.cfg.hetero_base,
-            self.cfg.hetero_jitter,
-            self.cfg.hetero_straggler_every,
-        )
-        g = grad_bce(X, self.w, y).cpu()
-        return g
-
-    def apply_grad(self, grad_avg: torch.Tensor):
-        """Apply averaged gradient to local weights"""
-        self.optimizer.zero_grad()
-        self.w.grad = grad_avg.to(self.cfg.device)
-        self.optimizer.step()
-
+# --------------- SSGD: synchronous SGD using Ray Train TorchTrainer ---------------
+# SSGD implementation is in ssgd.py module (imported after classes are defined)
 
 # --------------- ASGD: parameter server applies immediately ---------------
 
@@ -339,6 +309,9 @@ class ASGDWorker:
 @ray.remote
 class SSPController:
     def __init__(self, d: int, lr: float, device: str, staleness: int, eval_every: int = 5):
+        # Configure logging for this Ray actor
+        self.logger = setup_actor_logging()
+
         self.w = torch.zeros(d, device=device, requires_grad=True)
         self.optimizer = torch.optim.Adam([self.w], lr=lr)
         self.device = device
@@ -357,7 +330,7 @@ class SSPController:
 
     def register_worker(self, wid: int):
         self.worker_steps[wid] = -1  # -1 means no steps completed yet
-        logger.debug(f"SSP: Registered worker {wid}")
+        self.logger.debug(f"SSP: Registered worker {wid}")
 
     def get_weights(self):
         return self.w.detach().cpu(), self.global_updates
@@ -384,9 +357,9 @@ class SSPController:
         can_go = staleness <= self.staleness
 
         if can_go:
-            logger.debug(f"SSP: Worker {wid} step {step_i} CAN PROCEED (min={min_step}, staleness={staleness})")
+            self.logger.debug(f"SSP: Worker {wid} step {step_i} CAN PROCEED (min={min_step}, staleness={staleness})")
         else:
-            logger.debug(f"SSP: Worker {wid} step {step_i} BLOCKED (min={min_step}, staleness={staleness} > bound={self.staleness})")
+            self.logger.debug(f"SSP: Worker {wid} step {step_i} BLOCKED (min={min_step}, staleness={staleness} > bound={self.staleness})")
 
         return can_go, staleness if can_go else 0
 
@@ -406,13 +379,16 @@ class SSPController:
 
         # Mark this step as COMPLETED after gradient is applied
         self.worker_steps[wid] = step_i
-        logger.debug(f"SSP: Worker {wid} completed step {step_i}, global_updates now {self.global_updates}")
+        self.logger.debug(f"SSP: Worker {wid} completed step {step_i}, global_updates now {self.global_updates}")
         return self.global_updates
 
 
 @ray.remote
 class SSPWorker:
     def __init__(self, worker_id: int, ctrl, shard, cfg: TrainConfig):
+        # Configure logging for this Ray actor
+        self.logger = setup_actor_logging()
+
         self.id = worker_id
         self.ctrl = ctrl
         self.ds = shard
@@ -422,11 +398,11 @@ class SSPWorker:
     def loop(self, iterations: int):
         """Worker loop that returns iteration metrics for aggregation."""
         metrics_data = []
-        logger.debug(f"SSP: Worker {self.id} starting loop for {iterations} iterations")
+        self.logger.debug(f"SSP: Worker {self.id} starting loop for {iterations} iterations")
         for i in range(iterations):
             t0 = time.time()
             # Poll until we get permission (non-blocking on actor side)
-            logger.debug(f"SSP: Worker {self.id} requesting permission for step {self.local_step}")
+            self.logger.debug(f"SSP: Worker {self.id} requesting permission for step {self.local_step}")
             while True:
                 can_go, staleness = ray.get(self.ctrl.can_proceed.remote(self.id, self.local_step))
                 if can_go:
@@ -450,7 +426,7 @@ class SSPWorker:
             # Push gradient (marks step as completed)
             ver = ray.get(self.ctrl.push_grad.remote(self.id, self.local_step, g))
             iter_time = time.time() - t0
-            logger.debug(f"SSP: Worker {self.id} completed step {self.local_step}, staleness={staleness}")
+            self.logger.debug(f"SSP: Worker {self.id} completed step {self.local_step}, staleness={staleness}")
             self.local_step += 1
 
             # Collect metrics data (will be recorded by main loop)
@@ -527,131 +503,6 @@ class LocalWorker:
 
 
 # --------------------------- Runner ---------------------------
-
-
-def run_ssgd_centralized(
-    cfg: TrainConfig,
-    shards: list,
-    X_full: torch.Tensor,
-    y_full: torch.Tensor,
-    metrics: Optional[MetricsCollector] = None,
-):
-    """SSGD with centralized coordinator (parameter server pattern)
-
-    Each sync round = 1 global update, so cfg.total_updates rounds
-    """
-    if metrics:
-        metrics.start_training()
-
-    num_workers = len(shards)
-    grad_size_bytes = cfg.d * 4  # float32 = 4 bytes
-    # Communication: workers -> coordinator (gradients) + coordinator -> workers (weights)
-    # For centralized: 2 * num_workers * grad_size per update
-    comm_bytes_per_update = 2 * num_workers * grad_size_bytes
-
-    coord = SSGDCoordinator.remote(cfg.d, cfg.lr, cfg.device)
-    workers = [SSGDWorker.remote(i, coord, shards[i], cfg) for i in range(num_workers)]
-
-    for t in range(cfg.total_updates):
-        grads = ray.get([w.step_once.remote() for w in workers])
-        w_new, step = ray.get(coord.aggregate_and_step.remote(grads))
-
-        # Evaluate and record loss
-        should_eval = (t % cfg.eval_every == 0) or (t == cfg.total_updates - 1)
-        if should_eval:
-            loss = float(F.binary_cross_entropy_with_logits(X_full @ w_new, y_full))
-            print(f"[SSGD-Centralized] step={step:4d} loss={loss:.5f}")
-
-            if metrics:
-                # Count communication for all updates since last eval
-                steps_since_last_eval = cfg.eval_every if t > 0 else (t + 1)
-                if t == cfg.total_updates - 1 and t % cfg.eval_every != 0:
-                    steps_since_last_eval = t % cfg.eval_every + 1
-                comm_bytes = comm_bytes_per_update * steps_since_last_eval
-                metrics.record_round(step, loss, comm_bytes=comm_bytes)
-
-    if metrics:
-        metrics.stop_training()
-        # Record final if not already recorded
-        if cfg.total_updates % cfg.eval_every != 0:
-            w_new = ray.get(coord.get_weights.remote())
-            loss = float(F.binary_cross_entropy_with_logits(X_full @ w_new, y_full))
-            metrics.record_final(cfg.total_updates, loss, cfg.total_updates)
-
-
-def run_ssgd_allreduce(
-    cfg: TrainConfig,
-    shards: list,
-    X_full: torch.Tensor,
-    y_full: torch.Tensor,
-    metrics: Optional[MetricsCollector] = None,
-):
-    """SSGD with AllReduce (decentralized gradient averaging)
-
-    Each sync round = 1 global update, so cfg.total_updates rounds
-    """
-    if metrics:
-        metrics.start_training()
-
-    num_workers = len(shards)
-    grad_size_bytes = cfg.d * 4  # float32 = 4 bytes
-    # AllReduce: Ring algorithm sends 2 * (N-1) / N * grad_size per worker
-    # Total communication: 2 * (num_workers - 1) * grad_size_bytes
-    comm_bytes_per_update = 2 * (num_workers - 1) * grad_size_bytes
-
-    orch = AllReduceOrchestrator.remote()
-    workers = [SSGDAllReduceWorker.remote(i, shards[i], cfg) for i in range(len(shards))]
-
-    for t in range(cfg.total_updates):
-        # All workers compute gradients on their local weights
-        grads = ray.get([w.compute_grad.remote() for w in workers])
-
-        # AllReduce: average gradients across workers
-        avg_grad = ray.get(orch.allreduce_grads.remote(grads))
-
-        # All workers apply the same averaged gradient
-        ray.get([w.apply_grad.remote(avg_grad) for w in workers])
-
-        # Evaluate and record loss
-        should_eval = (t % cfg.eval_every == 0) or (t == cfg.total_updates - 1)
-        if should_eval:
-            w = ray.get(workers[0].get_weights.remote())
-            loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
-            print(f"[SSGD-AllReduce] step={t+1:4d} loss={loss:.5f}")
-
-            if metrics:
-                # Count communication for all updates since last eval
-                if t == 0:
-                    steps_since_last_eval = 1
-                elif t == cfg.total_updates - 1 and t % cfg.eval_every != 0:
-                    steps_since_last_eval = (t % cfg.eval_every) + 1
-                else:
-                    steps_since_last_eval = cfg.eval_every
-                comm_bytes = comm_bytes_per_update * steps_since_last_eval
-                metrics.record_round(t + 1, loss, comm_bytes=comm_bytes)
-
-    if metrics:
-        metrics.stop_training()
-        # Record final if not already recorded
-        if cfg.total_updates % cfg.eval_every != 0:
-            w = ray.get(workers[0].get_weights.remote())
-            loss = float(F.binary_cross_entropy_with_logits(X_full @ w, y_full))
-            metrics.record_final(cfg.total_updates, loss, cfg.total_updates)
-
-
-def run_ssgd(
-    cfg: TrainConfig,
-    shards: list,
-    X_full: torch.Tensor,
-    y_full: torch.Tensor,
-    sync_method: str = "centralized",
-    metrics: Optional[MetricsCollector] = None,
-):
-    """Dispatcher for SSGD sync methods"""
-    if sync_method == "centralized":
-        run_ssgd_centralized(cfg, shards, X_full, y_full, metrics)
-    else:  # allreduce
-        run_ssgd_allreduce(cfg, shards, X_full, y_full, metrics)
 
 
 def run_asgd(
@@ -863,12 +714,6 @@ def run_localsgd(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["ssgd", "asgd", "ssp", "localsgd"], required=True)
-    parser.add_argument(
-        "--sync-method",
-        choices=["centralized", "allreduce"],
-        default="centralized",
-        help="Sync method for SSGD: centralized (coordinator) or allreduce (peer-to-peer)",
-    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--total-updates", type=int, default=100, help="Target total parameter updates across all methods")
     parser.add_argument("--dim", type=int, default=200)
@@ -899,16 +744,22 @@ def main():
     N = 200000
     noise = 0.0  # No label noise - should converge to ~0.1-0.2
     print(f"Creating synthetic data with N={N}, dim={args.dim}, noise={noise}, seed={args.seed}")
-    X, y = make_synthetic_data(N, args.dim, noise=noise, seed=args.seed)
+    dataset = SyntheticDataset(N, args.dim, noise=noise, seed=args.seed)
+    X = dataset.X
+    y = dataset.y
     actual_d = X.shape[1]  # Includes polynomial features (d+3)
     print(f"Feature dimension after polynomial expansion: {actual_d} (original: {args.dim})")
+
+    # Only create shards for custom algorithms (ASGD, SSP, LocalSGD)
+    # SSGD uses Ray Train which handles sharding automatically
     shards = []
-    per = N // args.num_workers
-    print(f"Sharding data into {args.num_workers} shards, each with {per} samples")
-    for i in range(args.num_workers):
-        Xi = X[i * per : (i + 1) * per]
-        yi = y[i * per : (i + 1) * per]
-        shards.append(DatasetShard.remote(Xi, yi, device))
+    if args.mode != "ssgd":
+        per = N // args.num_workers
+        print(f"Sharding data into {args.num_workers} shards, each with {per} samples")
+        for i in range(args.num_workers):
+            Xi = X[i * per : (i + 1) * per]
+            yi = y[i * per : (i + 1) * per]
+            shards.append(DatasetShard.remote(Xi, yi, device))
 
     cfg = TrainConfig(
         d=actual_d,
@@ -946,7 +797,6 @@ def main():
     # Save config
     config_dict = {
         "mode": args.mode,
-        "sync_method": args.sync_method,
         "num_workers": args.num_workers,
         "total_updates": args.total_updates,
         "dim": args.dim,
@@ -977,43 +827,44 @@ def main():
         "mode": args.mode,
         "hostname": socket.gethostname(),
         "timestamp": datetime.now().isoformat(),
-        "torch_version": torch_module.__version__,
         "device": args.device,
-        "git_sha": None,  # Could add git info later
+        "torch_version": torch_module.__version__,
+        "ray_version": ray.__version__,
     }
-    try:
-        import ray as ray_module
-
-        meta_dict["ray_version"] = ray_module.__version__
-    except:
-        pass
 
     with open(run_dir / "meta.json", "w") as f:
         json.dump(meta_dict, f, indent=2)
 
+    # Import run_ssgd here to avoid circular import (after all classes are defined)
+    from train_ssgd import run_ssgd
+
     # Run training
-    t0 = time.time()
-    if args.mode == "ssgd":
-        run_ssgd(cfg, shards, X, y, sync_method=args.sync_method, metrics=metrics)
-    elif args.mode == "asgd":
-        run_asgd(cfg, shards, X, y, metrics=metrics)
-    elif args.mode == "ssp":
-        run_ssp(cfg, shards, X, y, args.ssp_staleness, metrics=metrics)
-    elif args.mode == "localsgd":
-        run_localsgd(cfg, shards, X, y, args.local_k, metrics=metrics)
-    dt = time.time() - t0
-    print(f"Elapsed: {dt:.2f}s")
+    try:
+        t0 = time.time()
+        if args.mode == "ssgd":
+            run_ssgd(cfg, args.num_workers, dataset, metrics=metrics)
+        elif args.mode == "asgd":
+            run_asgd(cfg, shards, X, y, metrics=metrics)
+        elif args.mode == "ssp":
+            run_ssp(cfg, shards, X, y, args.ssp_staleness, metrics=metrics)
+        elif args.mode == "localsgd":
+            run_localsgd(cfg, shards, X, y, args.local_k, metrics=metrics)
+        dt = time.time() - t0
+        print(f"Elapsed: {dt:.2f}s")
 
-    # Write metrics
-    if metrics:
-        metrics.write_jsonl(run_dir / "events.jsonl")
-        summary = metrics.get_summary()
-        print(f"\nMetrics summary:")
-        for key, value in summary.items():
-            if key not in ("mode", "run_id"):
-                print(f"  {key}: {value}")
-
-    ray.shutdown()
+        # Write metrics
+        if metrics:
+            metrics.write_jsonl(run_dir / "events.jsonl")
+            summary = metrics.get_summary()
+            print(f"\nMetrics summary:")
+            for key, value in summary.items():
+                if key not in ("mode", "run_id"):
+                    print(f"  {key}: {value}")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise e
+    finally:
+        ray.shutdown()
 
 
 if __name__ == "__main__":

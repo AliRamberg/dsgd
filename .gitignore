@@ -48,5 +48,7 @@ terraform/instance_*_details.json
 terraform/vastai_key
 terraform/vastai_key.pub
 terraform/*.tfplan
+
 experiments/
 comparison_plots/
+runs/

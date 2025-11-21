@@ -11,8 +11,9 @@ dependencies = [
     "ipykernel>=6.30.1",
     "matplotlib>=3.10.6",
     "pandas>=2.3.3",
-    "ray>=2.49.2",
+    "ray[train]>=2.49.2",
     "torch>=2.8.0",
     "torchinfo>=1.8.0",
     "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
 ]
