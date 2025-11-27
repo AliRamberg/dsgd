@@ -23,19 +23,19 @@ set -e  # Exit on error
 # ============================================================================
 
 # Experiment run ID (creates experiments/run-${RUN_ID}/)
-RUN_ID=14
+RUN_ID=17
 
 # Training modes to test
-MODES=("ssgd")
+MODES=("asgd" "ssp" "localsgd")
 
 # Number of workers
-WORKERS=(4)
+WORKERS=(2)
 
 # Total updates/steps/epochs (for SSGD)
 STEPS=(100)
 
 # SSP staleness windows (only used for ssp mode)
-SSP_STALENESS=(10)
+SSP_STALENESS=(5)
 
 # LocalSGD local steps (only used for localsgd mode)
 LOCAL_K=(5)
@@ -71,7 +71,7 @@ build_base_cmd() {
     local steps=$3
     local name=$4
     
-    echo "uv run main.py --mode ${mode} --total-updates ${steps} --num-workers ${workers} ${COMMON_ARGS} --run-name=${name}"
+    echo "uv run --active main.py --mode ${mode} --total-updates ${steps} --num-workers ${workers} ${COMMON_ARGS} --run-name=${name}"
 }
 
 for mode in "${MODES[@]}"; do

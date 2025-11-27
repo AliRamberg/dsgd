@@ -59,7 +59,7 @@ def train_func_ssgd(config: TrainConfig):
         # Create iterator for this epoch (Ray Data handles shuffling automatically)
         logger.debug(f"SSGD: Creating batch iterator for epoch {epoch}")
         batch_iterator = dataset_shard.iter_torch_batches(
-            batch_size=config.batch,
+            batch_size=config.batch_size,
             drop_last=True,
             device=device,
         )
@@ -132,10 +132,15 @@ def run_ssgd(
     # Note: Using ray.data.Dataset.zip() method (not builtin zip function)
     X_np = dataset.X.detach().cpu().numpy()
     y_np = dataset.y.detach().cpu().numpy()
+    x = 1
+    print({"x": [x], "y": [2 * x]})
+    # train_dataset = ray.data.from_items([{"x": [x], "y": [2 * x]} for x in range(200)])
+
     
-    ds_X = ray.data.from_numpy(X_np).rename_columns(["X"])
-    ds_y = ray.data.from_numpy(y_np).rename_columns(["y"])
-    ray_dataset = ds_X.zip(ds_y)  # Dataset.zip() combines columns horizontally
+
+    # ds_X = ray.data.from_numpy(X_np).rename_columns(["X"])
+    # ds_y = ray.data.from_numpy(y_np).rename_columns(["y"])
+    # ray_dataset = ds_X.zip(ds_y)  # Dataset.zip() combines columns horizontally
 
     # Configure scaling
     use_gpu = cfg.device == "cuda" and torch.cuda.is_available()
@@ -165,7 +170,7 @@ def run_ssgd(
         initial_loss = float(F.binary_cross_entropy_with_logits(dataset.X @ torch.zeros(cfg.d), dataset.y))
 
         # Estimate batches per epoch (approximate)
-        batches_per_epoch = len(dataset) // cfg.batch
+        batches_per_epoch = len(dataset) // cfg.batch_size
         total_batches = cfg.total_updates * batches_per_epoch
 
         # Record loss at eval_every intervals

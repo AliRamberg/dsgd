@@ -137,14 +137,6 @@ class SyntheticDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-def grad_bce(X: torch.Tensor, w: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Gradient of BCE: X^T (sigmoid(Xw) - y) / N"""
-    logits = X @ w
-    probs = torch.sigmoid(logits)
-    N = X.shape[0]
-    return X.t() @ (probs - y) / N
-
-
 # Simulate worker heterogeneity by sleeping (in seconds)
 def sleep_heterogeneity(worker_id: int, base: float, jitter: float, straggler_every: int = 0, step: int = 0):
     """Simulate worker delays
@@ -174,7 +166,7 @@ def sleep_heterogeneity(worker_id: int, base: float, jitter: float, straggler_ev
 class TrainConfig:
     d: int = 200  # feature dimension
     lr: float = 0.05  # learning rate
-    batch: int = 512  # batch size per worker step
+    batch_size: int = 512  # batch size per worker step
     total_updates: int = 100  # target total parameter updates across all methods
     device: str = "cpu"
     hetero_base: float = 0.0  # baseline worker delay in seconds (0 = no delays)
@@ -183,7 +175,6 @@ class TrainConfig:
     eval_every: int = 5  # evaluate loss every N steps
 
 
-@ray.remote
 class DatasetShard:
     """Legacy DatasetShard for custom algorithms (ASGD/SSP/LocalSGD)"""
 
@@ -193,7 +184,7 @@ class DatasetShard:
         self.N = self.X.shape[0]
         self.device = device
 
-    def sample_batch(self, batch: int):
+    def sample_batch(self, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
         idx = torch.randint(0, self.N, (batch,), device=self.device)
         return self.X[idx], self.y[idx]
 
@@ -247,13 +238,6 @@ class ASGDParameterServer:
         # return current model version index
         return self.num_updates
 
-    def evaluate_and_store(self, X: torch.Tensor, y: torch.Tensor):
-        """Evaluate loss on full dataset and store in history"""
-        with torch.no_grad():
-            loss = float(F.binary_cross_entropy_with_logits(X @ self.w, y))
-        self.loss_history.append((self.num_updates, loss))
-        return loss
-
 
 @ray.remote
 class ASGDWorker:
@@ -270,7 +254,7 @@ class ASGDWorker:
         for i in range(iterations):
             t0 = time.time()
             w = ray.get(self.ps.get_weights.remote()).to(self.cfg.device)
-            X, y = ray.get(self.ds.sample_batch.remote(self.cfg.batch))
+            X, y = self.ds.sample_batch(self.cfg.batch_size)
             sleep_heterogeneity(
                 self.id,
                 self.cfg.hetero_base,
@@ -278,7 +262,10 @@ class ASGDWorker:
                 self.cfg.hetero_straggler_every,
                 step=self.local_step,
             )
-            g = grad_bce(X, w, y).cpu()
+            w.requires_grad_(True)
+            loss = F.binary_cross_entropy_with_logits(X @ w, y)
+            (g,) = torch.autograd.grad(loss, w, create_graph=True)
+            g = g.cpu()
             # submit grad and get global update index
             ver = ray.get(self.ps.push_grad.remote(g))
             iter_time = time.time() - t0
@@ -308,7 +295,8 @@ class ASGDWorker:
 
 @ray.remote
 class SSPController:
-    def __init__(self, d: int, lr: float, device: str, staleness: int, eval_every: int = 5):
+
+    def __init__(self, d: int, lr: float, device: str, staleness: int, eval_every: int = 5) -> SSPController:
         # Configure logging for this Ray actor
         self.logger = setup_actor_logging()
 
@@ -337,13 +325,6 @@ class SSPController:
 
     def get_loss_history(self):
         return self.loss_history
-
-    def evaluate_and_store(self, X: torch.Tensor, y: torch.Tensor):
-        """Evaluate loss on full dataset and store in history"""
-        with torch.no_grad():
-            loss = float(F.binary_cross_entropy_with_logits(X @ self.w, y))
-        self.loss_history.append((self.global_updates, loss))
-        return loss
 
     def can_proceed(self, wid: int, step_i: int):
         # SSP rule: fast workers can be at most s ahead of slowest worker
@@ -385,7 +366,8 @@ class SSPController:
 
 @ray.remote
 class SSPWorker:
-    def __init__(self, worker_id: int, ctrl, shard, cfg: TrainConfig):
+
+    def __init__(self, worker_id: int, ctrl, shard, cfg: TrainConfig) -> SSPWorker:
         # Configure logging for this Ray actor
         self.logger = setup_actor_logging()
 
@@ -413,7 +395,7 @@ class SSPWorker:
             # Fetch current weights and compute gradient
             (w, global_step) = ray.get(self.ctrl.get_weights.remote())
             w = w.to(self.cfg.device)
-            X, y = ray.get(self.ds.sample_batch.remote(self.cfg.batch))
+            X, y = self.ds.sample_batch(self.cfg.batch_size)
             sleep_heterogeneity(
                 self.id,
                 self.cfg.hetero_base,
@@ -421,10 +403,13 @@ class SSPWorker:
                 self.cfg.hetero_straggler_every,
                 step=self.local_step,
             )
-            g = grad_bce(X, w, y).cpu()
+
+            w.requires_grad_(True)
+            loss = F.binary_cross_entropy_with_logits(X @ w, y)
+            (g,) = torch.autograd.grad(loss, w, create_graph=True)
 
             # Push gradient (marks step as completed)
-            ver = ray.get(self.ctrl.push_grad.remote(self.id, self.local_step, g))
+            ver = ray.get(self.ctrl.push_grad.remote(self.id, self.local_step, g.cpu()))
             iter_time = time.time() - t0
             self.logger.debug(f"SSP: Worker {self.id} completed step {self.local_step}, staleness={staleness}")
             self.local_step += 1
@@ -479,7 +464,7 @@ class LocalWorker:
 
     def local_steps(self, K: int) -> torch.Tensor:
         for k in range(K):
-            X, y = ray.get(self.ds.sample_batch.remote(self.cfg.batch))
+            X, y = self.ds.sample_batch(self.cfg.batch_size)
             sleep_heterogeneity(
                 self.id,
                 self.cfg.hetero_base,
@@ -487,9 +472,9 @@ class LocalWorker:
                 self.cfg.hetero_straggler_every,
                 step=k,
             )
-            g = grad_bce(X, self.w, y)
             self.optimizer.zero_grad()
-            self.w.grad = g
+            loss = F.binary_cross_entropy_with_logits(X @ self.w, y)
+            loss.backward()
             self.optimizer.step()
         return self.w.detach().cpu()
 
@@ -752,19 +737,19 @@ def main():
 
     # Only create shards for custom algorithms (ASGD, SSP, LocalSGD)
     # SSGD uses Ray Train which handles sharding automatically
-    shards = []
+    shards: list[DatasetShard] = []
     if args.mode != "ssgd":
         per = N // args.num_workers
         print(f"Sharding data into {args.num_workers} shards, each with {per} samples")
         for i in range(args.num_workers):
             Xi = X[i * per : (i + 1) * per]
             yi = y[i * per : (i + 1) * per]
-            shards.append(DatasetShard.remote(Xi, yi, device))
+            shards.append(DatasetShard(Xi, yi, device))
 
     cfg = TrainConfig(
         d=actual_d,
         lr=args.lr,
-        batch=args.batch,
+        batch_size=args.batch,
         total_updates=args.total_updates,
         device=device,
         hetero_base=args.hetero_base,
