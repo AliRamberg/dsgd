@@ -37,9 +37,10 @@ def load_run(run_path: Path) -> dict[str, Any]:
 
     df = pd.DataFrame(events)
 
-    # Calculate duration from first and last event timestamps
-    duration_sec = None
-    if not df.empty and "timestamp" in df.columns:
+    # Get duration from meta.json (training_time_sec) if available,
+    # otherwise fall back to calculating from event timestamps
+    duration_sec = meta.get("training_time_sec")
+    if duration_sec is None and not df.empty and "timestamp" in df.columns:
         timestamps = df["timestamp"].dropna()
         if len(timestamps) > 0:
             duration_sec = timestamps.max() - timestamps.min()

@@ -529,3 +529,4 @@ def grad_mse(X, w, y):
 ✅ **No cluster needed**: Ray simulates distribution on single machine
 ❌ **Not production**: Missing checkpointing, fault tolerance, monitoring
 ❌ **Single machine**: Doesn't show true network bottlenecks
+- always use --active with uv with ddp package

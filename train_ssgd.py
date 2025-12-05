@@ -5,7 +5,7 @@ for better code organization and modularity.
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from logger import logger
 import torch
@@ -17,16 +17,13 @@ import ray.data
 from ray.train import ScalingConfig
 from ray.train.torch import TorchTrainer
 
-from main import TrainConfig, MetricsCollector, sleep_heterogeneity, SyntheticDataset
+from config import TrainConfig
+from data import SyntheticDataset
+from utils import sleep_heterogeneity
+from model import LinearModel
 
-
-class LinearModel(torch.nn.Module):
-    def __init__(self, d: int):
-        super().__init__()
-        self.w = torch.nn.Parameter(torch.zeros(d))
-
-    def forward(self, x):
-        return x @ self.w
+if TYPE_CHECKING:
+    from metrics import MetricsCollector
 
 
 def train_func_ssgd(config: TrainConfig):
@@ -49,9 +46,6 @@ def train_func_ssgd(config: TrainConfig):
     optimizer = torch.optim.Adam(model.parameters(), lr=scaled_lr)
     criterion = torch.nn.BCEWithLogitsLoss()
 
-    # Get device
-    device = ray.train.torch.get_device()
-
     # Training loop: do total_updates epochs, processing all batches in each epoch
     step = 0
 
@@ -61,7 +55,7 @@ def train_func_ssgd(config: TrainConfig):
         batch_iterator = dataset_shard.iter_torch_batches(
             batch_size=config.batch_size,
             drop_last=True,
-            device=device,
+            device=ray.train.torch.get_device(),
         )
 
         # Accumulate evaluation loss during training (if evaluating this step)
@@ -70,6 +64,7 @@ def train_func_ssgd(config: TrainConfig):
         should_eval = (step == 0) or ((step + 1) % config.eval_every == 0)
 
         # Process all batches in this epoch
+        model.train()
         for batch in batch_iterator:
             logger.debug(f"SSGD: Processing batch {step}")
             # Extract X and y from dict format (Ray Data returns dicts when using from_items)
@@ -99,15 +94,15 @@ def train_func_ssgd(config: TrainConfig):
             loss.backward()
             optimizer.step()
 
-            step += 1
             ray.train.report(metrics={"train_loss": loss.item(), "step": step})
+            step += 1
 
         # Report evaluation loss at end of epoch (if we were accumulating)
         if should_eval and eval_total_samples > 0:
             eval_loss = eval_total_loss / eval_total_samples
             ray.train.report(metrics={"eval_loss": eval_loss, "step": step})
 
-        logger.debug(f"[SSGD] Completed epoch {epoch + 1}/{config.total_updates}, total steps: {step}")
+        logger.debug(f"[SSGD] Completed epoch {epoch}/{config.total_updates}, total steps: {step}")
 
 
 def run_ssgd(
@@ -132,15 +127,8 @@ def run_ssgd(
     # Note: Using ray.data.Dataset.zip() method (not builtin zip function)
     X_np = dataset.X.detach().cpu().numpy()
     y_np = dataset.y.detach().cpu().numpy()
-    x = 1
-    print({"x": [x], "y": [2 * x]})
-    # train_dataset = ray.data.from_items([{"x": [x], "y": [2 * x]} for x in range(200)])
 
-    
-
-    # ds_X = ray.data.from_numpy(X_np).rename_columns(["X"])
-    # ds_y = ray.data.from_numpy(y_np).rename_columns(["y"])
-    # ray_dataset = ds_X.zip(ds_y)  # Dataset.zip() combines columns horizontally
+    ray_dataset = ray.data.from_numpy(X_np).zip(ray.data.from_numpy(y_np)).rename_columns(["X", "y"])
 
     # Configure scaling
     use_gpu = cfg.device == "cuda" and torch.cuda.is_available()

@@ -23,16 +23,16 @@ set -e  # Exit on error
 # ============================================================================
 
 # Experiment run ID (creates experiments/run-${RUN_ID}/)
-RUN_ID=17
+RUN_ID=20
 
 # Training modes to test
-MODES=("asgd" "ssp" "localsgd")
+MODES=("ssgd")
 
 # Number of workers
-WORKERS=(2)
+WORKERS=(2 4)
 
 # Total updates/steps/epochs (for SSGD)
-STEPS=(100)
+STEPS=(50)
 
 # SSP staleness windows (only used for ssp mode)
 SSP_STALENESS=(5)
@@ -42,9 +42,9 @@ LOCAL_K=(5)
 
 # Common hyperparameters
 LR=0.1
-HETERO_BASE=0.05
+HETERO_BASE=0.00
 HETERO_JITTER=0.02
-HETERO_STRAGGLER_EVERY=5
+HETERO_STRAGGLER_EVERY=0
 
 # ============================================================================
 # Script logic (usually no need to modify below)
