@@ -13,8 +13,9 @@ class LinearModel(nn.Module):
 
     def __init__(self, d: int):
         super().__init__()
-        self.w = nn.Parameter(torch.zeros(d))
+        self.w = nn.Parameter(torch.randn(d) * 0.01)
+        self.b = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        """Forward pass: y = x @ w"""
-        return x @ self.w
+        """Forward pass: y = x @ w + b"""
+        return x @ self.w + self.b

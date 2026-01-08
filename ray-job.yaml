@@ -1,0 +1,75 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: ssgd-runner
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8080"
+spec:
+  entrypoint: python -u /app/main.py --mode ssgd --num-workers 4 --total-updates 2000 --num-samples 200000 --noise 0.005 --dim 100 --lr 0.005 --batch 4096 --device cpu
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 1800
+  runtimeEnvYAML: |
+    env_vars:
+      PYTHONPATH: "/app"
+  rayClusterSpec:
+    rayVersion: "2.53.0"
+    headGroupSpec:
+      rayStartParams:
+        metrics-export-port: "8080"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: ddp-ray:local
+              imagePullPolicy: Never
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+                - containerPort: 52365
+                  name: api
+                - containerPort: 8080
+                  name: metrics
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: "8Gi"
+                requests:
+                  cpu: "500m"
+                  memory: "2Gi"
+    workerGroupSpecs:
+      - replicas: 3
+        minReplicas: 3
+        maxReplicas: 5
+        groupName: worker-group
+        rayStartParams:
+          metrics-export-port: "8080"
+        template:
+          spec:
+            containers:
+              - name: ray-worker
+                image: ddp-ray:local
+                imagePullPolicy: Never
+                ports:
+                  - containerPort: 6379
+                    name: gcs-server
+                  - containerPort: 8265
+                    name: dashboard
+                  - containerPort: 10001
+                    name: client
+                  - containerPort: 52365
+                    name: api
+                  - containerPort: 8080
+                    name: metrics
+                resources:
+                  limits:
+                    cpu: "2"
+                    memory: "4Gi"
+                  requests:
+                    cpu: "500m"
+                    memory: "2Gi"

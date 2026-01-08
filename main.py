@@ -34,7 +34,7 @@ from __future__ import annotations
 import argparse
 import time
 import socket
-from typing import Optional
+import os
 import json
 
 from datetime import datetime
@@ -43,9 +43,7 @@ import torch
 import torch.nn.functional as F
 import ray
 
-from logger import logger
 from metrics import MetricsCollector
-from model import LinearModel
 from config import TrainConfig
 from data import SyntheticDataset, DatasetShard
 from utils import set_seed
@@ -65,6 +63,8 @@ def main():
     parser.add_argument("--mode", choices=["ssgd", "asgd", "ssp", "localsgd"], required=True)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--total-updates", type=int, default=100, help="Target total parameter updates across all methods")
+    parser.add_argument("--num-samples", type=int, default=200000, help="Number of samples in synthetic dataset (default: 200000)")
+    parser.add_argument("--noise", type=float, default=0.0, help="Label noise probability (default: 0.0)")
     parser.add_argument("--dim", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--batch", type=int, default=512)
@@ -79,21 +79,18 @@ def main():
     )
     parser.add_argument("--outdir", type=str, default="runs", help="Output directory for logs and metrics")
     parser.add_argument("--run-name", type=str, default=None, help="Custom run name (default: auto-generated)")
-    parser.add_argument("--eval-every", type=int, default=5, help="Evaluate loss every N steps")
-    parser.add_argument("--log-every", type=int, default=1, help="Log metrics every N iterations")
+    parser.add_argument("--eval-every", type=int, default=5, help="Evaluate and log metrics every N steps")
     parser.add_argument("--no-logging", action="store_true", help="Disable metrics logging")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = args.device
 
-    ray.init(ignore_reinit_error=True, include_dashboard=False)
+    ray.init(ignore_reinit_error=True, _metrics_export_port=8080)
 
     # Data: generate and shard
-    N = 200000
-    noise = 0.0  # No label noise - should converge to ~0.1-0.2
-    print(f"Creating synthetic data with N={N}, dim={args.dim}, noise={noise}, seed={args.seed}")
-    dataset = SyntheticDataset(N, args.dim, noise=noise, seed=args.seed)
+    print(f"Creating synthetic data with N={args.num_samples}, dim={args.dim}, noise={args.noise}, seed={args.seed}")
+    dataset = SyntheticDataset(args.num_samples, args.dim, noise=args.noise, seed=args.seed)
     X = dataset.X.to(device)
     y = dataset.y.to(device)
     actual_d = X.shape[1]  # Includes polynomial features (d+3)
@@ -103,7 +100,7 @@ def main():
     # SSGD uses Ray Train which handles sharding automatically
     shards: list[DatasetShard] = []
     if args.mode != "ssgd":
-        per = N // args.num_workers
+        per = args.num_samples // args.num_workers
         print(f"Sharding data into {args.num_workers} shards, each with {per} samples")
         for i in range(args.num_workers):
             Xi = X[i * per : (i + 1) * per]
@@ -143,6 +140,8 @@ def main():
         "mode": args.mode,
         "num_workers": args.num_workers,
         "total_updates": args.total_updates,
+        "num_samples": args.num_samples,
+        "noise": args.noise,
         "dim": args.dim,
         "lr": args.lr,
         "batch": args.batch,
@@ -156,7 +155,6 @@ def main():
         "outdir": args.outdir,
         "run_name": args.run_name,
         "eval_every": args.eval_every,
-        "log_every": args.log_every,
         "no_logging": args.no_logging,
     }
     with open(run_dir / "config.json", "w") as f:

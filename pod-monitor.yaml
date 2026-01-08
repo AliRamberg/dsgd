@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ray-monitor
+  namespace: prometheus-system
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - ray-operator
+      - ray-jobs
+  podMetricsEndpoints:
+    - port: metrics
+      path: /
+      interval: 2s
+      scrapeTimeout: 10s
+  selector:
+    matchLabels:
+      ray.io/is-ray-node: "yes"

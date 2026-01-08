@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Experiments and data
+experiments/
+runs/
+*.png
+*.jpg
+*.json
+*.jsonl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+CLAUDE.md
+
+# Kubernetes
+*.yaml
+!Dockerfile
+kube-values.yaml
+
+# Other
+.DS_Store
+*.log
+tf/
+.cursor/
+comparison_plots/

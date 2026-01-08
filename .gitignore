@@ -37,18 +37,17 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Terraform
-terraform/.terraform/
-terraform/.terraform.lock.hcl
-terraform/terraform.tfstate
-terraform/terraform.tfstate.backup
-terraform/terraform.tfvars
-terraform/instance_*_id.txt
-terraform/instance_*_details.json
-terraform/vastai_key
-terraform/vastai_key.pub
-terraform/*.tfplan
 
 experiments/
 comparison_plots/
 runs/
+runs_test/
+
+# Terraform directory (root level)
+tf/
+
+# IDE and tooling
+.cursor/
+.ruff_cache/
+.pytest_cache/
+.claude/

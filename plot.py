@@ -300,7 +300,7 @@ def plot_communication_bytes(runs: list[dict], outdir: Path):
     fig, ax = plt.subplots(figsize=(10, 6))
 
     labels = []
-    bytes_per_update = []
+    bytes_per_update_bytes = []
     colors = []
 
     color_map = {
@@ -334,27 +334,26 @@ def plot_communication_bytes(runs: list[dict], outdir: Path):
                 seconds = duration_sec % 60
                 duration_str = f" ({minutes}m {seconds:.1f}s)"
 
+        num_workers = config.get("num_workers", 1)
+
         if mode == "ssgd":
             sync = config.get("sync_method", "centralized")
-            # For SSGD, comm_bytes is per round
-            avg_bytes_per_round = comm_events["comm_bytes"].mean()
-            # Per update: divide by _every (assuming comm is counted over eval_every steps)
-            eval_every = config.get("eval_every", 5)
-            avg_bytes_per_update = avg_bytes_per_round / eval_every
+            # SSGD logs per-worker comm per iteration; scale to cluster total
+            avg_bytes_per_update = comm_events["comm_bytes"].mean() * num_workers
             labels.append(f"SSGD-{sync}{duration_str}")
-            bytes_per_update.append(avg_bytes_per_update / 1e6)  # MB
+            bytes_per_update_bytes.append(avg_bytes_per_update)
             colors.append(color_map.get(mode, "gray"))
         elif mode == "asgd":
-            # ASGD: comm_bytes is per iteration
-            avg_bytes = comm_events["comm_bytes"].mean()
+            # ASGD: comm_bytes is per iteration per worker; scale to cluster total
+            avg_bytes = comm_events["comm_bytes"].mean() * num_workers
             labels.append(f"ASGD (w={config['num_workers']}){duration_str}")
-            bytes_per_update.append(avg_bytes / 1e6)  # MB
+            bytes_per_update_bytes.append(avg_bytes)
             colors.append(color_map.get(mode, "gray"))
         elif mode == "ssp":
-            # SSP: comm_bytes is per iteration
-            avg_bytes = comm_events["comm_bytes"].mean()
+            # SSP: comm_bytes is per iteration per worker; scale to cluster total
+            avg_bytes = comm_events["comm_bytes"].mean() * num_workers
             labels.append(f"SSP (s={config['ssp_staleness']}){duration_str}")
-            bytes_per_update.append(avg_bytes / 1e6)  # MB
+            bytes_per_update_bytes.append(avg_bytes)
             colors.append(color_map.get(mode, "gray"))
         elif mode == "localsgd":
             # LocalSGD: comm_bytes is per round
@@ -363,15 +362,29 @@ def plot_communication_bytes(runs: list[dict], outdir: Path):
             # Bytes per update = total bytes per round / K local steps
             avg_bytes_per_update = avg_bytes_per_round / K
             labels.append(f"LocalSGD (K={K}){duration_str}")
-            bytes_per_update.append(avg_bytes_per_update / 1e6)  # MB per update
+            bytes_per_update_bytes.append(avg_bytes_per_update)
             colors.append(color_map.get(mode, "gray"))
 
-    if not bytes_per_update:
+    if not bytes_per_update_bytes:
         print("⚠️  No communication byte data found")
         return
 
+    # Pick a readable unit based on the magnitude of the data
+    max_bytes = max(bytes_per_update_bytes)
+    if max_bytes < 1024:  # < 1 KB
+        unit = "B"
+        scale = 1
+    elif max_bytes < 1024**2:  # < 1 MB
+        unit = "KB"
+        scale = 1024
+    else:
+        unit = "MB"
+        scale = 1024**2
+
+    bytes_per_update = [b / scale for b in bytes_per_update_bytes]
+
     bars = ax.bar(labels, bytes_per_update, color=colors, alpha=0.7, edgecolor="black")
-    ax.set_ylabel("Communication (MB per update)", fontsize=12)
+    ax.set_ylabel(f"Communication ({unit} per update)", fontsize=12)
     ax.set_title("Communication Overhead Comparison", fontsize=14, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.3)
     plt.xticks(rotation=15, ha="right")
@@ -379,7 +392,7 @@ def plot_communication_bytes(runs: list[dict], outdir: Path):
     # Add value labels on bars
     for bar, val in zip(bars, bytes_per_update):
         height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2.0, height, f'{val:.1f}', ha='center', va='bottom', fontsize=10)
+        ax.text(bar.get_x() + bar.get_width() / 2.0, height, f"{val:.3g}", ha="center", va="bottom", fontsize=10)
 
     outfile = outdir / "communication_bytes.png"
     plt.tight_layout()

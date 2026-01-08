@@ -29,7 +29,7 @@ RUN_ID=20
 MODES=("ssgd")
 
 # Number of workers
-WORKERS=(2 4)
+WORKERS=(2)
 
 # Total updates/steps/epochs (for SSGD)
 STEPS=(50)
@@ -46,6 +46,8 @@ HETERO_BASE=0.00
 HETERO_JITTER=0.02
 HETERO_STRAGGLER_EVERY=0
 
+BATCH_SIZE=32000
+EVAL_EVERY=5
 # ============================================================================
 # Script logic (usually no need to modify below)
 # ============================================================================
@@ -62,7 +64,7 @@ echo "=========================================="
 echo ""
 
 # Common hyperparameters (constant across all experiments)
-COMMON_ARGS="--lr ${LR} --hetero-base ${HETERO_BASE} --hetero-jitter ${HETERO_JITTER} --hetero-straggler-every ${HETERO_STRAGGLER_EVERY} --outdir ${OUTDIR}/"
+COMMON_ARGS=" --batch ${BATCH_SIZE} --lr ${LR} --hetero-base ${HETERO_BASE} --hetero-jitter ${HETERO_JITTER} --hetero-straggler-every ${HETERO_STRAGGLER_EVERY} --outdir ${OUTDIR}/"
 
 # Base command template - builds common command with variable parameters
 build_base_cmd() {
@@ -71,7 +73,7 @@ build_base_cmd() {
     local steps=$3
     local name=$4
     
-    echo "uv run --active main.py --mode ${mode} --total-updates ${steps} --num-workers ${workers} ${COMMON_ARGS} --run-name=${name}"
+    echo "uv run --active main.py --mode ${mode} --total-updates ${steps} --eval-every ${EVAL_EVERY} --num-workers ${workers} ${COMMON_ARGS} --run-name=${name}"
 }
 
 for mode in "${MODES[@]}"; do

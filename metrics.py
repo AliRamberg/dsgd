@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
-
+from ray.util.metrics import Counter, Gauge, Histogram
 
 @dataclass
 class MetricEvent:
@@ -194,3 +194,40 @@ class MetricsCollector:
                 event_dict = event.to_dict()
                 event_dict["run_id"] = self.run_id
                 f.write(json.dumps(event_dict) + "\n")
+
+
+class PrometheusMetricCollector:
+    """Prometheus metrics collector using Ray's metrics API.
+
+    Replaces file-based metrics with direct Prometheus export for Kubernetes deployments.
+    """
+
+    def __init__(self, mode: str):
+        # Common tags for all metrics
+        self.tags = {"mode": mode}
+
+        # Metrics defined in plot.py
+        self.loss_gauge = Gauge("ddp_loss", description="Current loss value", tag_keys=("mode",))
+        self.latency_hist = Histogram(
+            "ddp_iteration_latency_ms",
+            description="Iteration latency in milliseconds",
+            boundaries=[10, 50, 100, 200, 500, 1000, 2000, 5000],
+            tag_keys=("mode", "worker_id"),
+        )
+        self.comm_bytes_counter = Counter("ddp_comm_bytes_total", description="Total communication bytes", tag_keys=("mode", "worker_id"))
+        self.step_gauge = Gauge("ddp_step", description="Current global step", tag_keys=("mode",))
+
+        # Initialize metrics with default values to ensure they appear in Prometheus
+        self.step_gauge.set(0, self.tags)
+        self.loss_gauge.set(0.0, self.tags)
+
+    def log_iteration(self, worker_id: int, latency_ms: float, comm_bytes: int):
+        """Log iteration metrics from a worker."""
+        tags: dict[str, str] = {**self.tags, "worker_id": str(worker_id)}
+        self.latency_hist.observe(latency_ms, tags)
+        self.comm_bytes_counter.inc(comm_bytes, tags)
+
+    def log_loss(self, step: int, loss: float):
+        """Log loss evaluation metrics."""
+        self.step_gauge.set(step, self.tags)
+        self.loss_gauge.set(loss, self.tags)
