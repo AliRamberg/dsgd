@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 from ray.util.metrics import Counter, Gauge, Histogram
 
+
 @dataclass
 class MetricEvent:
     """Unified event schema for all metrics."""
@@ -172,7 +173,9 @@ class MetricsCollector:
             if latencies:
                 summary["avg_iteration_latency_ms"] = sum(latencies) / len(latencies)
 
-            staleness_vals = [e.staleness for e in iterations if e.staleness is not None]
+            staleness_vals = [
+                e.staleness for e in iterations if e.staleness is not None
+            ]
             if staleness_vals:
                 summary["avg_staleness"] = sum(staleness_vals) / len(staleness_vals)
                 summary["max_staleness"] = max(staleness_vals)
@@ -202,32 +205,201 @@ class PrometheusMetricCollector:
     Replaces file-based metrics with direct Prometheus export for Kubernetes deployments.
     """
 
-    def __init__(self, mode: str):
-        # Common tags for all metrics
-        self.tags = {"mode": mode}
+    def __init__(
+        self,
+        mode: str,
+        worker_id: Optional[int] = None,
+        num_workers: int = 1,
+        batch_size: int = 512,
+    ):
+        # Common tags for all metrics (remove high cardinality worker_id)
+        self.mode = mode
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.base_tags = {
+            "mode": mode,
+            "num_workers": str(num_workers),
+            "batch_size": str(batch_size),
+        }
 
-        # Metrics defined in plot.py
-        self.loss_gauge = Gauge("ddp_loss", description="Current loss value", tag_keys=("mode",))
-        self.latency_hist = Histogram(
-            "ddp_iteration_latency_ms",
-            description="Iteration latency in milliseconds",
-            boundaries=[10, 50, 100, 200, 500, 1000, 2000, 5000],
-            tag_keys=("mode", "worker_id"),
+        # Core metrics - always available
+        self.loss_hist = Histogram(
+            "ray_train_loss",
+            description="Training loss value histogram",
+            boundaries=[
+                0.01,
+                0.05,
+                0.1,
+                0.15,
+                0.2,
+                0.25,
+                0.3,
+                0.35,
+                0.4,
+                0.45,
+                0.5,
+                0.55,
+                0.6,
+                0.65,
+                0.7,
+                0.75,
+                0.8,
+                1.0,
+            ],
+            tag_keys=("mode", "num_workers", "batch_size"),
         )
-        self.comm_bytes_counter = Counter("ddp_comm_bytes_total", description="Total communication bytes", tag_keys=("mode", "worker_id"))
-        self.step_gauge = Gauge("ddp_step", description="Current global step", tag_keys=("mode",))
+        self.step_gauge = Gauge(
+            "ray_train_worker_steps_total",
+            description="Total steps completed by worker",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+        self.gradient_updates_counter = Counter(
+            "ray_train_gradient_updates_total",
+            description="Total gradient updates applied",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
 
-        # Initialize metrics with default values to ensure they appear in Prometheus
-        self.step_gauge.set(0, self.tags)
-        self.loss_gauge.set(0.0, self.tags)
+        # Performance metrics
+        self.iteration_latency_hist = Histogram(
+            "ray_train_iteration_latency_seconds",
+            description="Per-iteration latency in seconds",
+            boundaries=[0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
 
-    def log_iteration(self, worker_id: int, latency_ms: float, comm_bytes: int):
+        # Communication metrics
+        self.comm_bytes_counter = Counter(
+            "ray_train_communication_bytes_total",
+            description="Total communication bytes (AllReduce)",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+        self.comm_time_counter = Counter(
+            "ray_train_communication_seconds_total",
+            description="Total time spent in communication",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # Staleness metrics (ASGD/SSP)
+        self.staleness_gauge = Gauge(
+            "ray_train_staleness_current",
+            description="Current staleness value for async methods",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+        self.staleness_avg_gauge = Gauge(
+            "ray_train_staleness_avg",
+            description="Average staleness over recent window",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+        self.staleness_max_gauge = Gauge(
+            "ray_train_staleness_max",
+            description="Maximum staleness observed",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # Synchronization metrics (SSGD)
+        self.barrier_wait_counter = Counter(
+            "ray_train_barrier_wait_seconds_total",
+            description="Total time spent waiting at synchronization barriers",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # LocalSGD metrics
+        self.localsgd_rounds_counter = Counter(
+            "ray_train_localsgd_rounds_total",
+            description="Total LocalSGD synchronization rounds completed",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+        self.localsgd_drift_gauge = Gauge(
+            "ray_train_localsgd_drift",
+            description="Gradient drift between workers (L2 norm)",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # Samples processed
+        self.samples_processed_counter = Counter(
+            "ray_train_samples_processed_total",
+            description="Total training samples processed",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # Epoch progression - use Counter instead of Gauge for better Prometheus compatibility
+        self.epoch_counter = Counter(
+            "ray_train_epochs_completed_total",
+            description="Total training epochs completed",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # Training state
+        self.start_time_gauge = Gauge(
+            "ray_train_start_time",
+            description="Unix timestamp when training started",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+        self.end_time_gauge = Gauge(
+            "ray_train_end_time",
+            description="Unix timestamp when training ended",
+            tag_keys=("mode", "num_workers", "batch_size"),
+        )
+
+        # Initialize core metrics to 0 so they appear in Prometheus immediately
+        self.step_gauge.set(0, self.base_tags)
+
+    def log_iteration(
+        self, step: int, latency_ms: float, comm_bytes: int = 0, staleness: float = 0
+    ):
         """Log iteration metrics from a worker."""
-        tags: dict[str, str] = {**self.tags, "worker_id": str(worker_id)}
-        self.latency_hist.observe(latency_ms, tags)
-        self.comm_bytes_counter.inc(comm_bytes, tags)
+        self.step_gauge.set(step, self.base_tags)
+        self.iteration_latency_hist.observe(
+            latency_ms / 1000.0, self.base_tags
+        )  # Convert to seconds
+        self.gradient_updates_counter.inc(1, self.base_tags)
+
+        if comm_bytes > 0:
+            self.comm_bytes_counter.inc(comm_bytes, self.base_tags)
+
+        if staleness > 0:
+            self.staleness_gauge.set(staleness, self.base_tags)
 
     def log_loss(self, step: int, loss: float):
         """Log loss evaluation metrics."""
-        self.step_gauge.set(step, self.tags)
-        self.loss_gauge.set(loss, self.tags)
+        self.step_gauge.set(step, self.base_tags)
+        self.loss_hist.observe(loss, self.base_tags)
+
+    def log_staleness_stats(self, avg_staleness: float, max_staleness: float):
+        """Log aggregated staleness statistics (ASGD/SSP)."""
+        self.staleness_avg_gauge.set(avg_staleness, self.base_tags)
+        self.staleness_max_gauge.set(max_staleness, self.base_tags)
+
+    def log_barrier_wait(self, wait_time_seconds: float):
+        """Log time spent waiting at synchronization barrier (SSGD)."""
+        self.barrier_wait_counter.inc(wait_time_seconds, self.base_tags)
+
+    def log_localsgd_round(self, round_num: int, drift: float = 0):
+        """Log LocalSGD synchronization round."""
+        self.localsgd_rounds_counter.inc(1, self.base_tags)
+
+        if drift > 0:
+            self.localsgd_drift_gauge.set(drift, self.base_tags)
+
+    def log_samples_processed(self, num_samples: int):
+        """Log number of training samples processed."""
+        self.samples_processed_counter.inc(num_samples, self.base_tags)
+
+    def log_epoch(self, epoch: int):
+        """Log epoch completion (increments counter at end of epoch)."""
+        # Only increment when starting a new epoch (not on epoch 0)
+        if epoch > 0:
+            self.epoch_counter.inc(1, self.base_tags)
+
+    def log_training_start(self):
+        """Mark training start time."""
+        import time
+
+        self.start_time_gauge.set(time.time(), self.base_tags)
+
+    def log_training_end(self):
+        """Mark training end time."""
+        import time
+
+        self.end_time_gauge.set(time.time(), self.base_tags)

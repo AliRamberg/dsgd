@@ -1,0 +1,140 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: allreduce-2workers
+  namespace: ray-jobs
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8080"
+spec:
+  # Automatically suspend (don't delete) after job completes
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 7200  # Keep for 2 hours for log inspection
+
+  # Entrypoint for running the training job
+  entrypoint: |
+    python main.py \
+      --mode ssgd \
+      --num-workers 2 \
+      --total-updates 5 \
+      --batch 256 \
+      --lr 0.001 \
+      --device cuda \
+      --eval-every 1 \
+      --dataset-path s3://yahli-asap-ddp/datasets/synthetic-5k-1.5Md \
+      --seed 42
+
+  # Ray cluster configuration
+  rayClusterSpec:
+    rayVersion: '2.53.0'
+
+    # Head node configuration
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        metrics-export-port: '8080'  # Prometheus metrics
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: 496105080108.dkr.ecr.us-east-2.amazonaws.com/ddp:latest
+            imagePullPolicy: Always
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+            ports:
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+            - containerPort: 8265
+              name: dashboard
+              protocol: TCP
+            - containerPort: 6379
+              name: redis
+              protocol: TCP
+            - containerPort: 10001
+              name: client
+              protocol: TCP
+            resources:
+              requests:
+                cpu: "2"
+                memory: "8Gi"
+              limits:
+                cpu: "4"
+                memory: "16Gi"
+
+    # Worker node configuration
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 2  # 2 GPU workers
+      minReplicas: 2
+      maxReplicas: 2
+      rayStartParams:
+        metrics-export-port: '8080'
+        # Increase object store memory to handle larger batches
+        object-store-memory: '26843545600'  # 25Gi for model + batch data
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: 496105080108.dkr.ecr.us-east-2.amazonaws.com/ddp:latest
+            imagePullPolicy: Always
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+            ports:
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+            resources:
+              requests:
+                cpu: "2"
+                memory: "20Gi"  # Increased from 16Gi to handle larger batches + init container
+                nvidia.com/gpu: "1"  # 1 GPU per worker
+              limits:
+                cpu: "4"
+                memory: "40Gi"  # Increased from 32Gi for safety margin
+                nvidia.com/gpu: "1"
+          nodeSelector:
+            karpenter.sh/capacity-type: "on-demand"
+            karpenter.k8s.aws/instance-gpu-count: "1"
+          # Ensure each worker gets its own node with 1 GPU
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    ray.io/group: gpu-workers
+                topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                ray.io/group: gpu-workers
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"
