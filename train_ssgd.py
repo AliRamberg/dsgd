@@ -10,6 +10,7 @@ import time
 
 from logger import logger
 import torch
+import numpy as np
 import ray
 import ray.train
 import ray.train.torch
@@ -70,14 +71,11 @@ def train_func_ssgd(config: TrainConfig):
         if worker_id == 0:
             logger.debug(f"SSGD: Creating batch iterator for epoch {epoch}")
 
-        # Recreate iterator for each epoch (required for Ray Data)
-        # Use local_shuffle_buffer_size for streaming-compatible shuffling (avoids materializing entire dataset)
         batch_iterator = dataset_shard.iter_torch_batches(
             batch_size=config.batch_size,
             drop_last=True,
             device=ray.train.torch.get_device(),
-            local_shuffle_buffer_size=config.batch_size
-            * 4,  # Shuffle buffer = 4 batches
+            local_shuffle_buffer_size=config.batch_size * 4,
         )
 
         model.train()
@@ -85,8 +83,15 @@ def train_func_ssgd(config: TrainConfig):
         for batch in batch_iterator:
             t0 = time.perf_counter()
 
+            # iter_torch_batches returns tensors directly
             X_batch = batch["X"]
             y_batch = batch["y"]
+
+            # Ensure correct dtype
+            if X_batch.dtype != torch.float32:
+                X_batch = X_batch.to(torch.float32)
+            if y_batch.dtype != torch.float32:
+                y_batch = y_batch.to(torch.float32)
 
             logits = model(X_batch).squeeze()
             loss = criterion(logits, y_batch)
@@ -164,27 +169,14 @@ def run_ssgd(
 
     # Prepare Ray dataset
     if dataset_path:
-        # Load from disk or S3 (memory efficient)
-        import torch
-
-        # Ray Data automatically discovers all parquet files in directory
         print(f"Loading Ray dataset from parquet: {dataset_path}")
-        ray_dataset = ray.data.read_parquet(dataset_path)
 
-        # Convert list columns to proper numpy arrays using pandas format
-        # X is stored as list-of-lists in parquet, pandas handles this well
-        def convert_to_arrays(batch):
-            import numpy as np
-
-            # batch is a pandas DataFrame
-            # batch["X"] is a Series of lists, convert to 2D array
-            X_array = np.stack(batch["X"].values).astype(np.float32)
-            y_array = batch["y"].values.astype(np.float32)
-            return {"X": X_array, "y": y_array}
-
-        # Note: Avoid .random_shuffle() as it materializes the entire dataset
-        # Instead, use local_shuffle_buffer_size in iter_torch_batches for streaming shuffle
-        ray_dataset = ray_dataset.map_batches(convert_to_arrays, batch_format="pandas")
+        # Lazy loading: Ray Data will only read and process data as needed during training
+        # No eager map_batches - conversion happens on-demand in iter_torch_batches
+        ray_dataset = ray.data.read_parquet(
+            dataset_path,
+            override_num_blocks=num_workers,  # One block per worker
+        )
     else:
         # Generate in-memory (original behavior)
         X_np = dataset.X.detach().cpu().numpy()

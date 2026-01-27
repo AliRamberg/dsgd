@@ -37,6 +37,14 @@ CLAUDE.md
 *.yaml
 !Dockerfile
 kube-values.yaml
+kuberay/
+
+# Testing and development
+plot.py
+run_test.sh
+test*.py
+Dockerfile*
+.dockerignore
 
 # Other
 .DS_Store

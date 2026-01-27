@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ddp-image-builder
+  namespace: ray-jobs
+spec:
+  ttlSecondsAfterFinished: 600  # Auto-cleanup after 10 minutes
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: image-builder-sa
+      containers:
+      - name: kaniko
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+        - "--context=git://github.com/AliRamberg/dsgd.git#refs/heads/main"
+        - "--dockerfile=Dockerfile"
+        - "--destination=496105080108.dkr.ecr.us-east-2.amazonaws.com/ddp:latest"
+        - "--cache=true"
+        - "--cache-repo=496105080108.dkr.ecr.us-east-2.amazonaws.com/ddp-cache"
+        env:
+        - name: AWS_REGION
+          value: "us-east-2"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8Gi"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: image-builder-sa
+  namespace: ray-jobs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: image-builder-role
+  namespace: ray-jobs
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: image-builder-rolebinding
+  namespace: ray-jobs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: image-builder-role
+subjects:
+- kind: ServiceAccount
+  name: image-builder-sa
+  namespace: ray-jobs
