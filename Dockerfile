@@ -29,10 +29,6 @@ WORKDIR /app
 COPY --link --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --link --from=builder /opt/venv /opt/venv
 
-# Copy dependency files (less frequently changing)
-COPY --link pyproject.toml uv.lock ./
-
-# Copy application code LAST (most frequently changing)
 COPY --link . .
 
 ENV VIRTUAL_ENV=/opt/venv \

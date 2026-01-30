@@ -1,4 +1,4 @@
-# Python
+# Python cache and build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
@@ -7,48 +7,71 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Virtual environments
 .venv/
 venv/
 env/
-
-# Experiments and data
-experiments/
-runs/
-*.png
-*.jpg
-*.json
-*.jsonl
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
 
 # Git
 .git/
 .gitignore
 
-# Documentation
-*.md
-CLAUDE.md
+# IDE and editor files
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+.DS_Store
 
-# Kubernetes
+# Documentation (not needed at runtime)
+*.md
+
+# Data and outputs (not needed in image)
+experiments/
+runs/
+logs/
+*.png
+*.jpg
+noise_exploration.png
+comparison_plots/
+
+# Configuration files (use env vars or ConfigMaps instead)
+*.json
+*.jsonl
+mcp_config.json
+gpus.csv
+
+# Kubernetes and infrastructure (managed externally)
 *.yaml
-!Dockerfile
-kube-values.yaml
+*.yaml.bak
+k8s-build-job.yaml
+pod-monitor.yaml
+ray-job*.yaml
+nvidia-device-plugin*.yaml
 kuberay/
 
-# Testing and development
+# Terraform (infrastructure as code - not needed in runtime)
+tf/
+terraform.tfstate
+terraform.tfstate.backup
+
+# Development and testing scripts (not needed at runtime)
 plot.py
 run_test.sh
 test*.py
-Dockerfile*
-.dockerignore
+generate_dataset.py
+prepare_upload.py
+update_dashboard.py
 
-# Other
-.DS_Store
-*.log
-tf/
-.cursor/
-comparison_plots/
+# Grafana dashboards (deploy separately)
+*dashboard*.json
+
+# Docker itself
+.dockerignore
+Dockerfile.dev
+Dockerfile.backup
+
+# Keep Dockerfile for reference but it's not copied anyway
+Dockerfile

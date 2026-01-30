@@ -2,12 +2,12 @@
 name = "ddp"
 version = "0.1.0"
 description = "Distributed Deep Learning Seminar - Code examples for distributed training strategies"
-authors = [{ name = "Yahli Ramberg", email = "[email protected]" }]
+authors = [{ name = "Yahli Ramberg" }]
 requires-python = ">=3.13"
 dependencies = [
   "ray[default,data,train]>=2.52.0",
-  "torch>=2.9.1",
-  "boto3>=1.35.0",
+  "torch>=2.10.0",
+  "boto3>=1.42.36",
   "tqdm>=4.66.0",
 ]
 
