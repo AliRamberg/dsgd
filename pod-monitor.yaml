@@ -14,7 +14,11 @@ spec:
     - port: metrics
       path: /
       interval: 2s
-      scrapeTimeout: 10s
+      scrapeTimeout: 1s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+          action: replace
   selector:
     matchLabels:
       ray.io/is-ray-node: "yes"

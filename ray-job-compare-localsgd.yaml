@@ -1,0 +1,181 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: compare-localsgd
+  namespace: ray-jobs
+  labels:
+    experiment: variant-comparison
+    variant: localsgd
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8080"
+spec:
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 3600
+
+  # --- Shared hyperparameters across all 4 variants ---
+  # LocalSGD with K=5 local steps between synchronization rounds.
+  # Uses Ray actors (not Ray Train). Workers scheduled on GPU nodes by Ray.
+  # total-updates=50 means 10 rounds of 5 local steps each.
+  entrypoint: |
+    python main.py \
+      --mode localsgd \
+      --num-workers 2 \
+      --total-updates 50 \
+      --batch 4096 \
+      --dim 5000 \
+      --num-samples 300000 \
+      --lr 0.0005 \
+      --device cuda \
+      --eval-every 1 \
+      --gradient-padding-mb 2048 \
+      --local-k 5 \
+      --seed 42
+
+  rayClusterSpec:
+    rayVersion: '2.53.0'
+
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        metrics-export-port: '8080'
+        object-store-memory: '42949672960'
+      template:
+        metadata:
+          annotations:
+            karpenter.sh/do-not-disrupt: "true"
+        spec:
+          containers:
+          - name: ray-head
+            image: 496105080108.dkr.ecr.us-east-2.amazonaws.com/ddp:latest
+            imagePullPolicy: Always
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: PYTORCH_NO_CUDA_MEMORY_CACHING
+              value: "0"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
+            - name: TORCH_NCCL_BLOCKING_WAIT
+              value: "1"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_P2P_DISABLE
+              value: "0"
+            - name: NCCL_SHM_DISABLE
+              value: "0"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
+            ports:
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+            - containerPort: 8265
+              name: dashboard
+              protocol: TCP
+            - containerPort: 6379
+              name: redis
+              protocol: TCP
+            - containerPort: 10001
+              name: client
+              protocol: TCP
+            resources:
+              requests:
+                cpu: "2"
+                memory: "32Gi"
+              limits:
+                cpu: "4"
+                memory: "64Gi"
+          nodeSelector:
+            karpenter.sh/capacity-type: "on-demand"
+            karpenter.sh/nodepool: "default"
+            kubernetes.io/arch: "amd64"
+
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 2
+      minReplicas: 2
+      maxReplicas: 2
+      rayStartParams:
+        metrics-export-port: '8080'
+        num-gpus: '1'
+        object-store-memory: '21474836480'
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: 496105080108.dkr.ecr.us-east-2.amazonaws.com/ddp:latest
+            imagePullPolicy: Always
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-2"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_P2P_DISABLE
+              value: "0"
+            - name: NCCL_SHM_DISABLE
+              value: "0"
+            - name: TORCH_NCCL_BLOCKING_WAIT
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
+            ports:
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+            resources:
+              requests:
+                cpu: "4"
+                memory: "25Gi"
+                nvidia.com/gpu: "1"
+              limits:
+                cpu: "8"
+                memory: "40Gi"
+                nvidia.com/gpu: "1"
+          nodeSelector:
+            karpenter.sh/capacity-type: "on-demand"
+            karpenter.sh/nodepool: "gpu"
+            karpenter.k8s.aws/instance-gpu-count: "1"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    ray.io/group: gpu-workers
+                topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                ray.io/group: gpu-workers
+          tolerations:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+            effect: "NoSchedule"

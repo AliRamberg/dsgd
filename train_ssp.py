@@ -10,6 +10,7 @@ from config import TrainConfig
 from model import LinearModel
 from utils import sleep_heterogeneity, setup_actor_logging
 from logger import logger
+from metrics import PrometheusMetricCollector
 
 if TYPE_CHECKING:
     from metrics import MetricsCollector
@@ -18,8 +19,15 @@ if TYPE_CHECKING:
 
 @ray.remote
 class SSPController:
-
-    def __init__(self, d: int, lr: float, device: str, staleness: int, eval_every: int = 5) -> SSPController:
+    def __init__(
+        self,
+        d: int,
+        lr: float,
+        device: str,
+        staleness: int,
+        eval_every: int = 5,
+        run_info: dict | None = None,
+    ) -> SSPController:
         # Configure logging for this Ray actor
         self.logger = setup_actor_logging()
 
@@ -30,9 +38,18 @@ class SSPController:
         self.eval_every = eval_every
         self.worker_steps: dict[int, int] = {}
         self.global_updates = 0
-        self.loss_history: list[tuple[int, float]] = []  # Track (update_count, loss) pairs
+        self.loss_history: list[
+            tuple[int, float]
+        ] = []  # Track (update_count, loss) pairs
         self.X_full = None
         self.y_full = None
+
+        # Prometheus metrics for controller
+        self.prom_metrics = PrometheusMetricCollector(
+            mode="ssp",
+            worker_id=None,
+            run_info=run_info,
+        )
 
     def set_full_dataset(self, X: torch.Tensor, y: torch.Tensor):
         """Set full dataset for periodic evaluation"""
@@ -44,7 +61,9 @@ class SSPController:
         self.logger.debug(f"SSP: Registered worker {wid}")
 
     def get_weights(self):
-        return {k: v.cpu() for k, v in self.model.state_dict().items()}, self.global_updates
+        return {
+            k: v.cpu() for k, v in self.model.state_dict().items()
+        }, self.global_updates
 
     def get_loss_history(self):
         return self.loss_history
@@ -61,9 +80,13 @@ class SSPController:
         can_go = staleness <= self.staleness
 
         if can_go:
-            self.logger.debug(f"SSP: Worker {wid} step {step_i} CAN PROCEED (min={min_step}, staleness={staleness})")
+            self.logger.debug(
+                f"SSP: Worker {wid} step {step_i} CAN PROCEED (min={min_step}, staleness={staleness})"
+            )
         else:
-            self.logger.debug(f"SSP: Worker {wid} step {step_i} BLOCKED (min={min_step}, staleness={staleness} > bound={self.staleness})")
+            self.logger.debug(
+                f"SSP: Worker {wid} step {step_i} BLOCKED (min={min_step}, staleness={staleness} > bound={self.staleness})"
+            )
 
         return can_go, staleness if can_go else 0
 
@@ -76,32 +99,54 @@ class SSPController:
         self.optimizer.step()
         self.global_updates += 1
 
+        # Log gradient update to Prometheus
+        self.prom_metrics.gradient_updates_counter.inc(
+            1, {"mode": "ssp", "worker_id": "controller"}
+        )
+
         # Periodic evaluation
         if self.X_full is not None and self.y_full is not None:
             if self.global_updates % self.eval_every == 0 or self.global_updates == 1:
                 with torch.no_grad():
                     logits = self.model(self.X_full).squeeze()
-                    loss = float(F.binary_cross_entropy_with_logits(logits, self.y_full))
+                    loss = float(
+                        F.binary_cross_entropy_with_logits(logits, self.y_full)
+                    )
                 self.loss_history.append((self.global_updates, loss))
+
+                # Log loss to Prometheus
+                self.prom_metrics.log_loss(self.global_updates, loss)
 
         # Mark this step as COMPLETED after gradient is applied
         self.worker_steps[wid] = step_i
-        self.logger.debug(f"SSP: Worker {wid} completed step {step_i}, global_updates now {self.global_updates}")
+        self.logger.debug(
+            f"SSP: Worker {wid} completed step {step_i}, global_updates now {self.global_updates}"
+        )
         return self.global_updates
 
 
 @ray.remote
 class SSPWorker:
-
     def __init__(self, worker_id: int, ctrl, shard, cfg: TrainConfig):
         # Configure logging for this Ray actor
         self.logger = setup_actor_logging()
 
         self.id = worker_id
         self.ctrl = ctrl
-        self.ds = shard
+        self.ds = shard.to(cfg.device)  # Move shard to GPU (arrived on CPU from head)
         self.cfg = cfg
         self.local_step = 0
+
+        # Prometheus metrics for this worker
+        self.prom_metrics = PrometheusMetricCollector(
+            mode="ssp",
+            worker_id=worker_id,
+            run_info=cfg.run_info,
+        )
+        self.prom_metrics.log_training_start()
+
+        # Track staleness for statistics
+        self.staleness_history = []
 
     def loop(self, iterations: int):
         """Worker loop that returns iteration metrics for aggregation."""
@@ -109,17 +154,29 @@ class SSPWorker:
         local_model = LinearModel(self.cfg.d).to(self.cfg.device)
 
         metrics_data = []
-        self.logger.debug(f"SSP: Worker {self.id} starting loop for {iterations} iterations")
+        self.logger.debug(
+            f"SSP: Worker {self.id} starting loop for {iterations} iterations"
+        )
         for i in range(iterations):
             t0 = time.time()
             # Poll until we get permission (non-blocking on actor side)
-            self.logger.debug(f"SSP: Worker {self.id} requesting permission for step {self.local_step}")
+            self.logger.debug(
+                f"SSP: Worker {self.id} requesting permission for step {self.local_step}"
+            )
+            wait_start = time.time()
             while True:
-                can_go, staleness = ray.get(self.ctrl.can_proceed.remote(self.id, self.local_step))
+                can_go, staleness = ray.get(
+                    self.ctrl.can_proceed.remote(self.id, self.local_step)
+                )
                 if can_go:
                     break
                 # Backoff before retrying
                 time.sleep(0.001)
+            wait_time = time.time() - wait_start
+
+            # Log barrier wait time if blocked
+            if wait_time > 0.01:  # Only log if we waited more than 10ms
+                self.prom_metrics.log_barrier_wait(wait_time)
 
             # Fetch current weights and compute gradient
             (state_dict, global_step) = ray.get(self.ctrl.get_weights.remote())
@@ -142,11 +199,36 @@ class SSPWorker:
             loss.backward()
 
             # Extract gradients and push (marks step as completed)
-            grad_dict = {name: p.grad.cpu() for name, p in local_model.named_parameters() if p.grad is not None}
-            ver = ray.get(self.ctrl.push_grad.remote(self.id, self.local_step, grad_dict))
+            grad_dict = {
+                name: p.grad.cpu()
+                for name, p in local_model.named_parameters()
+                if p.grad is not None
+            }
+            ver = ray.get(
+                self.ctrl.push_grad.remote(self.id, self.local_step, grad_dict)
+            )
 
             iter_time = time.time() - t0
-            self.logger.debug(f"SSP: Worker {self.id} completed step {self.local_step}, staleness={staleness}")
+            self.logger.debug(
+                f"SSP: Worker {self.id} completed step {self.local_step}, staleness={staleness}"
+            )
+
+            # Track staleness
+            self.staleness_history.append(staleness)
+
+            # Estimate communication bytes (model size + gradient size)
+            grad_size_bytes = self.cfg.d * 4  # float32 gradients
+            comm_bytes = grad_size_bytes * 2  # fetch weights + push gradients
+
+            # Log to Prometheus
+            self.prom_metrics.log_iteration(
+                step=self.local_step,
+                latency_ms=iter_time * 1000,
+                comm_bytes=comm_bytes,
+                staleness=staleness,
+            )
+            self.prom_metrics.log_samples_processed(self.cfg.batch_size)
+
             self.local_step += 1
 
             # Collect metrics data (will be recorded by main loop)
@@ -158,6 +240,14 @@ class SSPWorker:
                     "staleness": staleness,
                 }
             )
+
+        # Log final staleness statistics
+        if self.staleness_history:
+            avg_staleness = float(np.mean(self.staleness_history))
+            max_staleness = float(np.max(self.staleness_history))
+            self.prom_metrics.log_staleness_stats(avg_staleness, max_staleness)
+
+        self.prom_metrics.log_training_end()
 
         return {
             "worker": self.id,
@@ -187,8 +277,17 @@ def run_ssp(
     # Communication: each worker push is grad_size_bytes
     comm_bytes_per_update = grad_size_bytes
 
-    logger.debug(f"SSP: Starting training with staleness bound s={ssp_s}, {num_workers} workers")
-    ctrl = SSPController.remote(cfg.d, cfg.lr, cfg.device, staleness=ssp_s, eval_every=cfg.eval_every)
+    logger.debug(
+        f"SSP: Starting training with staleness bound s={ssp_s}, {num_workers} workers"
+    )
+    ctrl = SSPController.remote(
+        cfg.d,
+        cfg.lr,
+        cfg.device,
+        staleness=ssp_s,
+        eval_every=cfg.eval_every,
+        run_info=cfg.run_info,
+    )
     # Set full dataset for periodic evaluation (keep on same device as model)
     ray.get(ctrl.set_full_dataset.remote(X_full, y_full))
     workers = [SSPWorker.remote(i, ctrl, shards[i], cfg) for i in range(num_workers)]
@@ -225,11 +324,15 @@ def run_ssp(
         eval_model.load_state_dict(state_dict)
         eval_model.eval()
         with torch.no_grad():
-            final_loss = float(F.binary_cross_entropy_with_logits(eval_model(X_full).squeeze(), y_full))
+            final_loss = float(
+                F.binary_cross_entropy_with_logits(eval_model(X_full).squeeze(), y_full)
+            )
         metrics.record_final(ver, final_loss, ver)
         metrics.stop_training()
 
-        logger.debug(f"SSP: Training complete, final version={ver}, loss={final_loss:.5f}")
+        logger.debug(
+            f"SSP: Training complete, final version={ver}, loss={final_loss:.5f}"
+        )
         print(f"[SSP s={ssp_s}] updates={ver} loss={final_loss:.5f}")
     else:
         state_dict, ver = ray.get(ctrl.get_weights.remote())
@@ -237,10 +340,14 @@ def run_ssp(
         eval_model.load_state_dict(state_dict)
         eval_model.eval()
         with torch.no_grad():
-            loss = float(F.binary_cross_entropy_with_logits(eval_model(X_full).squeeze(), y_full))
+            loss = float(
+                F.binary_cross_entropy_with_logits(eval_model(X_full).squeeze(), y_full)
+            )
         logger.debug(f"SSP: Training complete, final version={ver}, loss={loss:.5f}")
         print(f"[SSP s={ssp_s}] updates={ver} loss={loss:.5f}")
 
     for s in stats:
         avg_staleness = float(np.mean([m["staleness"] for m in s["metrics_data"]]))
-        print(f"  worker {s['worker']}: steps={s['local_steps']} avg_staleness≈{avg_staleness:.2f}")
+        print(
+            f"  worker {s['worker']}: steps={s['local_steps']} avg_staleness≈{avg_staleness:.2f}"
+        )

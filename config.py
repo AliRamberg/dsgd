@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -12,3 +13,8 @@ class TrainConfig:
     hetero_jitter: float = 0.0  # jitter in worker delay
     hetero_straggler_every: int = 0  # straggler frequency (0 = disabled)
     eval_every: int = 5  # evaluate loss every N steps
+    gradient_padding_mb: int = (
+        0  # dummy params for network bottleneck testing (0 = disabled)
+    )
+    # Run-level metadata for Prometheus info metric (populated by main.py)
+    run_info: Optional[dict] = field(default=None, repr=False)

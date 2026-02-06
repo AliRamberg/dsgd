@@ -33,11 +33,11 @@ spec:
               key: AWS_SECRET_ACCESS_KEY
         resources:
           requests:
-            cpu: "4"
-            memory: "8Gi"
-          limits:
             cpu: "8"
             memory: "16Gi"
+          limits:
+            cpu: "16"
+            memory: "32Gi"
 ---
 apiVersion: v1
 kind: ServiceAccount

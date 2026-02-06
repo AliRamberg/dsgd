@@ -18,3 +18,4 @@ handler.setFormatter(formatter)
 
 # Add handler to logger
 logger.addHandler(handler)
+logger.propagate = False

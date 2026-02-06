@@ -43,11 +43,9 @@ comparison_plots/
 runs/
 runs_test/
 
-# Terraform directory (root level)
-tf/
-
 # IDE and tooling
 .cursor/
 .ruff_cache/
 .pytest_cache/
 .claude/
+kuberay/

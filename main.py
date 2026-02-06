@@ -34,11 +34,12 @@ from __future__ import annotations
 import argparse
 import time
 import socket
-import os
 import json
+import boto3
 
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 import torch
 import torch.nn.functional as F
 import ray
@@ -59,6 +60,7 @@ from train_localsgd import run_localsgd
 
 
 def main():
+    # fmt: off
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["ssgd", "asgd", "ssp", "localsgd"], required=True)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -74,30 +76,83 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--hetero-base", type=float, default=0.0, help="Worker delay baseline in seconds (default: 0.0 = no delays)")
     parser.add_argument("--hetero-jitter", type=float, default=0.0, help="Worker delay jitter (default: 0.0)")
-    parser.add_argument(
-        "--hetero-straggler-every", type=int, default=0, help="Make worker 0 a straggler every N steps (default: 0 = disabled)"
-    )
+    parser.add_argument("--hetero-straggler-every", type=int, default=0, help="Make worker 0 a straggler every N steps (default: 0 = disabled)")
+    parser.add_argument("--gradient-padding-mb", type=int, default=0, help="Add dummy params (MB) for network bottleneck testing (0=disabled, 400=BERT-sized)")
     parser.add_argument("--outdir", type=str, default="runs", help="Output directory for logs and metrics")
     parser.add_argument("--run-name", type=str, default=None, help="Custom run name (default: auto-generated)")
     parser.add_argument("--eval-every", type=int, default=5, help="Evaluate and log metrics every N steps")
     parser.add_argument("--no-logging", action="store_true", help="Disable metrics logging")
+    parser.add_argument("--dataset-path", type=str, default=None, help="Path to pre-saved parquet dataset (default: generate in-memory)")
+    # fmt: on
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = args.device
+    # Driver keeps data on CPU, Ray workers handle GPU placement
+    driver_device = "cpu"
 
     ray.init(ignore_reinit_error=True, _metrics_export_port=8080)
+    ray.data.DataContext.get_current().enable_rich_progress_bars = True
+    ray.data.DataContext.get_current().use_ray_tqdm = False
 
     # Data: generate and shard
-    print(f"Creating synthetic data with N={args.num_samples}, dim={args.dim}, noise={args.noise}, seed={args.seed}")
-    dataset = SyntheticDataset(args.num_samples, args.dim, noise=args.noise, seed=args.seed)
-    X = dataset.X.to(device)
-    y = dataset.y.to(device)
-    actual_d = X.shape[1]  # Includes polynomial features (d+3)
-    print(f"Feature dimension after polynomial expansion: {actual_d} (original: {args.dim})")
+    if args.dataset_path:
+        # Load from pre-saved parquet files (memory efficient for large dims)
+        dataset_path = args.dataset_path
+        print(f"Loading dataset from: {dataset_path}")
+
+        # Read metadata - handle S3 paths
+        if dataset_path.startswith("s3://"):
+            parsed = urlparse(dataset_path)
+            s3_bucket = parsed.netloc
+            s3_key = parsed.path.lstrip("/") + "/metadata.json"
+
+            s3_client = boto3.client("s3")
+            obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+            metadata = json.loads(obj["Body"].read().decode("utf-8"))
+        else:
+            # Local path
+            local_path = Path(dataset_path)
+            with open(local_path / "metadata.json") as f:
+                metadata = json.load(f)
+
+        actual_d = metadata["expanded_dim"]
+        num_samples = metadata["num_samples"]
+
+        print(f"  Samples: {num_samples:,}")
+        print(f"  Base dimension: {metadata['base_dim']:,}")
+        print(f"  Expanded dimension: {actual_d:,}")
+        print(f"  Dataset size: {metadata['dataset_size_gb']:.2f} GB")
+        print(f"  Model parameters: {actual_d + 1:,}")
+
+        # For SSGD mode: use Ray Data to stream from disk
+        if args.mode == "ssgd":
+            dataset = None  # Will be loaded in run_ssgd with ray.data.read_parquet()
+            X = None
+            y = None
+        else:
+            raise NotImplementedError(
+                f"--dataset-path only supported for SSGD mode currently (got: {args.mode})"
+            )
+    else:
+        # Generate in-memory (original behavior)
+        print(
+            f"Creating synthetic data with N={args.num_samples}, dim={args.dim}, noise={args.noise}, seed={args.seed}"
+        )
+        dataset = SyntheticDataset(
+            args.num_samples, args.dim, noise=args.noise, seed=args.seed
+        )
+        X = dataset.X.to(driver_device)
+        y = dataset.y.to(driver_device)
+        actual_d = X.shape[1]  # Includes polynomial features (d+3)
+        print(
+            f"Feature dimension after polynomial expansion: {actual_d} (original: {args.dim})"
+        )
 
     # Only create shards for custom algorithms (ASGD, SSP, LocalSGD)
-    # SSGD uses Ray Train which handles sharding automatically
+    # SSGD uses Ray Train which handles sharding automatically.
+    # Shards are created on CPU (driver_device) because the head node has no GPU.
+    # Workers move shard data to the target device inside their actor __init__.
     shards: list[DatasetShard] = []
     if args.mode != "ssgd":
         per = args.num_samples // args.num_workers
@@ -105,7 +160,33 @@ def main():
         for i in range(args.num_workers):
             Xi = X[i * per : (i + 1) * per]
             yi = y[i * per : (i + 1) * per]
-            shards.append(DatasetShard(Xi, yi, device))
+            shards.append(DatasetShard(Xi, yi, driver_device))
+
+    print(f"Learning rate: {args.lr}")
+
+    run_id = args.run_name
+    if not run_id:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_id = f"{timestamp}-{args.mode}-w{args.num_workers}-d{args.dim}-u{args.total_updates}-s{args.seed}"
+
+    # Build run_info dict for Prometheus info metric.
+    # This creates a ray_train_run_info gauge=1 with all config as labels,
+    # so you can join/filter any metric by run configuration in Grafana.
+    run_info = {
+        "mode": args.mode,
+        "num_workers": str(args.num_workers),
+        "lr": str(args.lr),
+        "batch_size": str(args.batch),
+        "total_updates": str(args.total_updates),
+        "dim": str(args.dim),
+        "num_samples": str(args.num_samples),
+        "device": device,
+        "seed": str(args.seed),
+        "ssp_staleness": str(args.ssp_staleness),
+        "local_k": str(args.local_k),
+        "gradient_padding_mb": str(args.gradient_padding_mb),
+        "run_id": run_id,
+    }
 
     cfg = TrainConfig(
         d=actual_d,
@@ -117,15 +198,21 @@ def main():
         hetero_jitter=args.hetero_jitter,
         hetero_straggler_every=args.hetero_straggler_every,
         eval_every=args.eval_every,
+        gradient_padding_mb=args.gradient_padding_mb,
+        run_info=run_info,
     )
 
-    base_loss = float(F.binary_cross_entropy_with_logits(X @ torch.zeros(actual_d, device=device), y))
-    print(f"Baseline loss (w=0): {base_loss:.5f} | Target: minimize via gradient descent")
-
-    run_id = args.run_name
-    if not run_id:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_id = f"{timestamp}-{args.mode}-w{args.num_workers}-d{args.dim}-u{args.total_updates}-s{args.seed}"
+    if X is not None and y is not None:
+        base_loss = float(
+            F.binary_cross_entropy_with_logits(
+                X @ torch.zeros(actual_d, device=driver_device), y
+            )
+        )
+        print(
+            f"Baseline loss (w=0): {base_loss:.5f} | Target: minimize via gradient descent"
+        )
+    else:
+        print("Skipping baseline loss computation (streaming mode)")
 
     outdir = Path(args.outdir)
     run_dir = outdir / run_id
@@ -177,7 +264,13 @@ def main():
     try:
         t0 = time.time()
         if args.mode == "ssgd":
-            run_ssgd(cfg, args.num_workers, dataset, metrics=metrics)
+            run_ssgd(
+                cfg,
+                args.num_workers,
+                dataset,
+                metrics=metrics,
+                dataset_path=args.dataset_path,
+            )
         elif args.mode == "asgd":
             run_asgd(cfg, shards, X, y, metrics=metrics)
         elif args.mode == "ssp":
