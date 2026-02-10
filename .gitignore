@@ -49,3 +49,27 @@ runs_test/
 .pytest_cache/
 .claude/
 kuberay/
+
+# Terraform
+.terraform
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+
+# Grafana / MCP config
+grafana-ddp-training-dashboard.json
+mcp_config.json
+
+# Presentation & diagrams
+Distributed-Deep-Learning-Presentation.pptx
+pdf_diagrams/
+noise_exploration.png
+
+# One-off scripts & data files
+generate_dataset.py
+prepare_upload.py
+upload_dashboard.py
+gpus.csv
+
+# Test artifacts
+test-minio/

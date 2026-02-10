@@ -1,0 +1,121 @@
+# DCGM Exporter configuration for GPU metrics collection
+
+# Deploy as DaemonSet to run on all GPU nodes
+daemonset:
+  enabled: true
+
+# Resource limits for the exporter
+# Increased memory limits to prevent OOMKill
+resources:
+  requests:
+    cpu: "100m"
+    memory: "512Mi"
+  limits:
+    cpu: "500m"
+    memory: "1Gi"
+
+# ServiceAccount and RBAC configuration
+serviceAccount:
+  create: true
+  automountServiceAccountToken: true
+  annotations: {}
+
+# RBAC settings for Kubernetes integration
+rbac:
+  create: true
+
+# ServiceMonitor for Prometheus integration
+serviceMonitor:
+  enabled: true
+  interval: 1s  # Scrape every 1s for high-frequency GPU monitoring (DCGM default: 2s collection)
+  honorLabels: false
+  additionalLabels:
+    release: prometheus
+
+# Node selector to ensure DCGM only runs on GPU nodes
+# Using Karpenter labels instead of nvidia.com/gpu=true since the device plugin
+# doesn't create that label - it only exposes the GPU resource
+nodeSelector:
+  karpenter.k8s.aws/instance-gpu-manufacturer: "nvidia"
+
+# Tolerations to allow scheduling on GPU nodes
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+
+# Custom metrics content - Helm will create ConfigMap and mount it automatically
+# Content from dcgm-configmap.conf
+customMetrics: |
+  # Custom DCGM metrics configuration for GPU idleness tracking
+  # Format: metric name, Prometheus metric type, help message
+
+  # GPU Utilization (0-100%)
+  DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization (in %).
+
+  # SM (Streaming Multiprocessor) Utilization - more granular than GPU util
+  DCGM_FI_DEV_SM_CLOCK, gauge, SM clock frequency (in MHz).
+  DCGM_FI_PROF_SM_ACTIVE, gauge, The ratio of cycles an SM has at least 1 warp assigned (in %).
+  DCGM_FI_PROF_SM_OCCUPANCY, gauge, The ratio of number of warps resident on an SM (in %).
+
+  # Memory Utilization
+  DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
+  DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (in MiB).
+  DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (in MiB).
+  DCGM_FI_DEV_VGPU_MEMORY_USAGE, gauge, Memory usage of the vGPU instance (in MiB).
+
+  # Compute Activity
+  DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Ratio of cycles the tensor (HMMA) pipe is active (in %).
+  DCGM_FI_PROF_PIPE_FP64_ACTIVE, gauge, Ratio of cycles the FP64 pipe is active (in %).
+  DCGM_FI_PROF_PIPE_FP32_ACTIVE, gauge, Ratio of cycles the FP32 pipe is active (in %).
+  DCGM_FI_PROF_PIPE_FP16_ACTIVE, gauge, Ratio of cycles the FP16 pipe is active (in %).
+
+  # DRAM Activity - shows memory bottlenecks
+  DCGM_FI_PROF_DRAM_ACTIVE, gauge, Ratio of cycles the device memory interface is active (in %).
+
+  # PCIe Throughput - shows data transfer to/from GPU
+  DCGM_FI_PROF_PCIE_TX_BYTES, counter, Total number of bytes transmitted over PCIe.
+  DCGM_FI_PROF_PCIE_RX_BYTES, counter, Total number of bytes received over PCIe.
+
+  # NVLink Throughput - shows inter-GPU communication
+  DCGM_FI_PROF_NVLINK_TX_BYTES, counter, Total number of bytes transmitted over NVLink.
+  DCGM_FI_PROF_NVLINK_RX_BYTES, counter, Total number of bytes received over NVLink.
+
+  # Power and Temperature - indirect idleness indicators
+  DCGM_FI_DEV_POWER_USAGE, gauge, Power usage (in W).
+  DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (in C).
+
+  # Graphics/Video Engine Activity - should be 0 for compute workloads
+  DCGM_FI_PROF_GR_ENGINE_ACTIVE, gauge, Ratio of time the graphics engine is active (in %).
+
+  # XID Errors - hardware errors
+  DCGM_FI_DEV_XID_ERRORS, gauge, Value of the last XID error encountered.
+
+# Arguments for DCGM exporter - use default mount path
+# Helm automatically mounts the ConfigMap to this path
+# Using default 2s collection interval (can't override due to Helm chart type conversion bug)
+arguments:
+  - "-f"
+  - "/etc/dcgm-exporter/default-counters.csv"
+
+# Security context - need privileged mode for DCGM on Bottlerocket
+# Bottlerocket requires privileged access to NVIDIA devices and libraries
+securityContext:
+  privileged: true
+  allowPrivilegeEscalation: true  # Must be true when privileged=true
+  capabilities:
+    add:
+      - SYS_ADMIN
+    drop: []  # Don't drop capabilities when privileged
+
+# Image configuration
+image:
+  repository: nvcr.io/nvidia/k8s/dcgm-exporter
+  tag: "3.3.8-3.6.0-ubuntu22.04"
+  pullPolicy: IfNotPresent
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 9400
+  annotations: {}

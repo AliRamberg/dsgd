@@ -1,0 +1,95 @@
+# Prometheus configuration
+prometheus:
+  podMonitor:
+    enabled: true
+  prometheusSpec:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "500m"        # Increased from 300m for better query performance
+        memory: "1Gi"       # Increased from 100Mi - Prometheus needs more memory for TSDB
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+    # Enable persistent storage for Prometheus TSDB
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi  # Adjust based on metrics volume and retention
+    # Additional scrape configs for services not covered by ServiceMonitors
+    additionalScrapeConfigs: []
+    # Enable ServiceMonitor selection across all namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+
+# Grafana configuration
+grafana:
+  enabled: true
+  resources:
+    requests:
+      cpu: "200m"          # Ensure responsive UI
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 10Gi
+  adminPassword: "admin"    # Change this in production!
+  # Explicitly enable sidecar for datasources
+  sidecar:
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      label: grafana_datasource
+      labelValue: "1"
+
+# Alertmanager configuration - DISABLED
+alertmanager:
+  enabled: false
+
+# Prometheus Operator - manages the entire stack
+prometheusOperator:
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  # Config reloader sidecar
+  prometheusConfigReloader:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "50Mi"
+      limits:
+        cpu: "200m"
+        memory: "100Mi"
+
+# Node Exporter - collects node-level metrics
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+# Kube State Metrics - exposes cluster state
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"

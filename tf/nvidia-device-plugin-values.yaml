@@ -1,0 +1,51 @@
+# NVIDIA Device Plugin configuration for GPU resource management
+
+# Node selector - only run on nodes with NVIDIA GPUs detected by Karpenter
+nodeSelector:
+  karpenter.k8s.aws/instance-gpu-manufacturer: "nvidia"
+
+# Tolerations to allow scheduling on GPU nodes
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+
+# Resource configuration
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "200m"
+    memory: "256Mi"
+
+# Runtime class configuration (for Bottlerocket)
+runtimeClassName: ""
+
+# IMPORTANT: Disable affinity rules to avoid chicken-and-egg problem
+# The default affinity rules require NFD labels that don't exist yet
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: karpenter.k8s.aws/instance-gpu-manufacturer
+              operator: In
+              values:
+                - nvidia
+
+# GPU feature discovery
+gfd:
+  enabled: true
+  nodeSelector:
+    karpenter.k8s.aws/instance-gpu-manufacturer: "nvidia"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+# Migrating strategy - allow time slicing if needed
+migStrategy: single
+
+# Fail on init error
+failOnInitError: true

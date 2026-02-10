@@ -1,0 +1,16 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  fsType: ext4
+  # gp3 allows customizing IOPS and throughput
+  iops: "3000"        # Default baseline (no extra cost up to 3000)
+  throughput: "125"   # Default baseline in MiB/s (no extra cost up to 125)
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain  # Prevent data loss when PVCs are deleted
