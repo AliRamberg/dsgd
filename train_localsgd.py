@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 from config import TrainConfig
 from model import LinearModel
 from utils import sleep_heterogeneity
-from metrics import PrometheusMetricCollector
+from metrics import PrometheusMetricCollector, MetricsCollector
 
 if TYPE_CHECKING:
     from metrics import MetricsCollector
@@ -32,7 +32,7 @@ class LocalAverager:
         return avg_state
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class LocalWorker:
     def __init__(
         self,
@@ -53,6 +53,8 @@ class LocalWorker:
         self.prom_metrics = PrometheusMetricCollector(
             mode="localsgd",
             worker_id=worker_id,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
             run_info=cfg.run_info,
         )
         self.prom_metrics.log_training_start()
@@ -123,12 +125,22 @@ def run_localsgd(
         metrics.start_training()
 
     num_workers = len(shards)
+
+    # Create driver-side Prometheus metrics for loss logging
+    prom_metrics = PrometheusMetricCollector(
+        mode="localsgd",
+        worker_id=None,
+        num_workers=num_workers,
+        batch_size=cfg.batch_size,
+        run_info=cfg.run_info,
+    )
+    prom_metrics.log_training_start()
     param_size_bytes = cfg.d * 4  # float32 = 4 bytes
     # Communication: all workers send weights, then receive averaged weights
     # Each sync round: num_workers * param_size (send) + num_workers * param_size (receive)
     comm_bytes_per_round = 2 * num_workers * param_size_bytes
 
-    avg = LocalAverager.remote(cfg.d, cfg.device)
+    avg = LocalAverager.remote(cfg.d, "cpu")
     workers = [LocalWorker.remote(i, shards[i], cfg) for i in range(len(shards))]
 
     w_global = {
@@ -147,7 +159,9 @@ def run_localsgd(
         step = (r + 1) * K  # Approximate global step
         should_eval = (r % 2 == 0) or (r == num_rounds - 1)
         if should_eval:
-            eval_model = LinearModel(cfg.d).to(cfg.device)
+            # Evaluate on the same device as the validation set (likely CPU on driver)
+            eval_device = X_full.device
+            eval_model = LinearModel(cfg.d).to(eval_device)
             eval_model.load_state_dict(w_global)
             eval_model.eval()
             with torch.no_grad():
@@ -157,6 +171,9 @@ def run_localsgd(
                     )
                 )
             print(f"[LocalSGD K={K}] round={r:3d} updates≈{step:4d} loss={loss:.5f}")
+
+            # Log loss to Prometheus
+            prom_metrics.log_loss(step=step, loss=loss)
 
             if metrics:
                 # Count communication for this round (and previous rounds if eval_every > 1)
@@ -169,12 +186,15 @@ def run_localsgd(
     # Finish training for all workers
     ray.get([w.finish_training.remote() for w in workers])
 
+    prom_metrics.log_training_end()
+
     if metrics:
         metrics.stop_training()
         # Record final if not already recorded
         if num_rounds % 2 != 0:
             final_step = num_rounds * K
-            eval_model = LinearModel(cfg.d).to(cfg.device)
+            eval_device = X_full.device
+            eval_model = LinearModel(cfg.d).to(eval_device)
             eval_model.load_state_dict(w_global)
             eval_model.eval()
             with torch.no_grad():
@@ -183,4 +203,6 @@ def run_localsgd(
                         eval_model(X_full).squeeze(), y_full
                     )
                 )
+            # Also log final loss to Prometheus
+            prom_metrics.log_loss(step=final_step, loss=final_loss)
             metrics.record_final(final_step, final_loss, cfg.total_updates)

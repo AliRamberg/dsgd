@@ -23,7 +23,7 @@ set -e  # Exit on error
 # ============================================================================
 
 # Experiment run ID (creates experiments/run-${RUN_ID}/)
-RUN_ID=20
+RUN_ID=25
 
 # Training modes to test
 MODES=("ssgd")
@@ -32,22 +32,27 @@ MODES=("ssgd")
 WORKERS=(2)
 
 # Total updates/steps/epochs (for SSGD)
-STEPS=(50)
+STEPS=(10)
 
 # SSP staleness windows (only used for ssp mode)
-SSP_STALENESS=(5)
+SSP_STALENESS=(2)
 
 # LocalSGD local steps (only used for localsgd mode)
 LOCAL_K=(5)
 
 # Common hyperparameters
-LR=0.1
+LR=0.001
 HETERO_BASE=0.00
-HETERO_JITTER=0.02
+HETERO_JITTER=0.00
 HETERO_STRAGGLER_EVERY=0
 
-BATCH_SIZE=32000
-EVAL_EVERY=5
+BATCH_SIZE=256
+EVAL_EVERY=1
+
+# Dataset path (S3 or local)
+# For local runs, use smaller dataset or leave empty to generate in-memory
+# DATASET_PATH="s3://yahli-asap-ddp/datasets/synthetic-5k-1.5Md"  # 30GB - too large for local
+DATASET_PATH=""  # Generate in-memory (use --dim and --num-samples instead)
 # ============================================================================
 # Script logic (usually no need to modify below)
 # ============================================================================
@@ -65,6 +70,11 @@ echo ""
 
 # Common hyperparameters (constant across all experiments)
 COMMON_ARGS=" --batch ${BATCH_SIZE} --lr ${LR} --hetero-base ${HETERO_BASE} --hetero-jitter ${HETERO_JITTER} --hetero-straggler-every ${HETERO_STRAGGLER_EVERY} --outdir ${OUTDIR}/"
+
+# Add dataset path if specified
+if [ -n "${DATASET_PATH}" ]; then
+    COMMON_ARGS="${COMMON_ARGS} --dataset-path ${DATASET_PATH}"
+fi
 
 # Base command template - builds common command with variable parameters
 build_base_cmd() {

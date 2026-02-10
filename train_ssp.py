@@ -25,6 +25,8 @@ class SSPController:
         lr: float,
         device: str,
         staleness: int,
+        num_workers: int,
+        batch_size: int,
         eval_every: int = 5,
         run_info: dict | None = None,
     ) -> SSPController:
@@ -48,6 +50,8 @@ class SSPController:
         self.prom_metrics = PrometheusMetricCollector(
             mode="ssp",
             worker_id=None,
+            num_workers=num_workers,
+            batch_size=batch_size,
             run_info=run_info,
         )
 
@@ -100,9 +104,7 @@ class SSPController:
         self.global_updates += 1
 
         # Log gradient update to Prometheus
-        self.prom_metrics.gradient_updates_counter.inc(
-            1, {"mode": "ssp", "worker_id": "controller"}
-        )
+        self.prom_metrics.gradient_updates_counter.inc(1, self.prom_metrics.base_tags)
 
         # Periodic evaluation
         if self.X_full is not None and self.y_full is not None:
@@ -125,7 +127,7 @@ class SSPController:
         return self.global_updates
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class SSPWorker:
     def __init__(self, worker_id: int, ctrl, shard, cfg: TrainConfig):
         # Configure logging for this Ray actor
@@ -141,6 +143,8 @@ class SSPWorker:
         self.prom_metrics = PrometheusMetricCollector(
             mode="ssp",
             worker_id=worker_id,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
             run_info=cfg.run_info,
         )
         self.prom_metrics.log_training_start()
@@ -283,8 +287,10 @@ def run_ssp(
     ctrl = SSPController.remote(
         cfg.d,
         cfg.lr,
-        cfg.device,
+        "cpu",
         staleness=ssp_s,
+        num_workers=num_workers,
+        batch_size=cfg.batch_size,
         eval_every=cfg.eval_every,
         run_info=cfg.run_info,
     )
@@ -320,7 +326,8 @@ def run_ssp(
 
         # Final evaluation
         state_dict, ver = ray.get(ctrl.get_weights.remote())
-        eval_model = LinearModel(cfg.d).to(cfg.device)
+        eval_device = X_full.device
+        eval_model = LinearModel(cfg.d).to(eval_device)
         eval_model.load_state_dict(state_dict)
         eval_model.eval()
         with torch.no_grad():
@@ -336,7 +343,8 @@ def run_ssp(
         print(f"[SSP s={ssp_s}] updates={ver} loss={final_loss:.5f}")
     else:
         state_dict, ver = ray.get(ctrl.get_weights.remote())
-        eval_model = LinearModel(cfg.d).to(cfg.device)
+        eval_device = X_full.device
+        eval_model = LinearModel(cfg.d).to(eval_device)
         eval_model.load_state_dict(state_dict)
         eval_model.eval()
         with torch.no_grad():

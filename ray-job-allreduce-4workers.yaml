@@ -17,25 +17,30 @@ spec:
     python main.py \
       --mode ssgd \
       --num-workers 4 \
-      --total-updates 50 \
-      --batch 256 \
-      --lr 0.01 \
+      --total-updates 10 \
+      --batch 8192 \
+      --dim 5000 \
+      --num-samples 300000 \
+      --lr 0.0005 \
       --device cuda \
-      --eval-every 1 \
-      --dataset-path s3://yahli-asap-ddp/datasets/synthetic-50k-5kd-linear-v2 \
-      --noise 0.0 \
-      --seed 1337
-
+      --eval-every 10 \
+      --gradient-padding-mb 1024 \
+      --hetero-base 0.00 \
+      --hetero-jitter 0.01 \
+      --hetero-straggler-every 0 \
+      --seed 42
   # Ray cluster configuration
   rayClusterSpec:
     rayVersion: '2.53.0'
-
-    # Head node configuration
     headGroupSpec:
       rayStartParams:
         dashboard-host: '0.0.0.0'
-        metrics-export-port: '8080'  # Prometheus metrics
+        metrics-export-port: '8080'
+        object-store-memory: '42949672960'  # 40Gi for dataset shard + batch data
       template:
+        metadata:
+          annotations:
+            karpenter.sh/do-not-disrupt: "true"
         spec:
           containers:
           - name: ray-head
@@ -54,6 +59,24 @@ spec:
                   key: AWS_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
               value: "us-east-2"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: PYTORCH_NO_CUDA_MEMORY_CACHING
+              value: "0"
+            # Disable NCCL optimizations that might overlap communication with computation
+            # Force synchronous AllReduce to create genuine GPU idleness
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
+            - name: TORCH_NCCL_BLOCKING_WAIT
+              value: "1"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_P2P_DISABLE
+              value: "0"
+            - name: NCCL_SHM_DISABLE
+              value: "0"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
             ports:
             - containerPort: 8080
               name: metrics
@@ -70,11 +93,14 @@ spec:
             resources:
               requests:
                 cpu: "2"
-                memory: "8Gi"
+                memory: "32Gi"
               limits:
                 cpu: "4"
-                memory: "16Gi"
-
+                memory: "64Gi"
+          nodeSelector:
+            karpenter.sh/capacity-type: "on-demand"
+            karpenter.sh/nodepool: "default"
+            kubernetes.io/arch: "amd64"
     # Worker node configuration
     workerGroupSpecs:
     - groupName: gpu-workers
@@ -83,6 +109,7 @@ spec:
       maxReplicas: 4
       rayStartParams:
         metrics-export-port: '8080'
+        object-store-memory: '21474836480'  # 20Gi for dataset shard + batch data
       template:
         spec:
           containers:
@@ -102,23 +129,38 @@ spec:
                   key: AWS_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
               value: "us-east-2"
+            # Disable NCCL optimizations that might overlap communication with computation
+            # Force synchronous AllReduce to create genuine GPU idleness
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_P2P_DISABLE
+              value: "0"
+            - name: NCCL_SHM_DISABLE
+              value: "0"
+            # Disable PyTorch optimizations that might hide communication bottlenecks
+            - name: TORCH_NCCL_BLOCKING_WAIT
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "0"
             ports:
             - containerPort: 8080
               name: metrics
               protocol: TCP
             resources:
               requests:
-                cpu: "2"
-                memory: "8Gi"
-                nvidia.com/gpu: "1"  # 1 GPU per worker
-              limits:
                 cpu: "4"
-                memory: "16Gi"
+                memory: "25Gi"
+                nvidia.com/gpu: "1"
+              limits:
+                cpu: "8"
+                memory: "40Gi"
                 nvidia.com/gpu: "1"
           nodeSelector:
             karpenter.sh/capacity-type: "on-demand"
+            karpenter.sh/nodepool: "gpu"
             karpenter.k8s.aws/instance-gpu-count: "1"
-          # Ensure each worker gets its own node with 1 GPU
           affinity:
             podAntiAffinity:
               requiredDuringSchedulingIgnoredDuringExecution:

@@ -21,7 +21,7 @@ spec:
     python main.py \
       --mode asgd \
       --num-workers 2 \
-      --total-updates 50 \
+      --total-updates 5000 \
       --batch 4096 \
       --dim 5000 \
       --num-samples 300000 \

@@ -31,6 +31,9 @@ spec:
         metrics-export-port: "8080"
         num-gpus: "1"
       template:
+        metadata:
+          annotations:
+            karpenter.sh/do-not-disrupt: "true"
         spec:
           affinity:
             podAntiAffinity:
@@ -82,6 +85,7 @@ spec:
           num-gpus: "1"
         template:
           spec:
+            runtimeClassName: nvidia
             affinity:
               podAntiAffinity:
                 requiredDuringSchedulingIgnoredDuringExecution:

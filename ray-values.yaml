@@ -1,8 +1,0 @@
-securityContext:
-  runAsNonRoot: false
-
-metrics:
-  serviceMonitor:
-    enabled: true
-    selector:
-      release: prometheus

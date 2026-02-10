@@ -22,7 +22,7 @@ spec:
     python main.py \
       --mode ssgd \
       --num-workers 2 \
-      --total-updates 50 \
+      --total-updates 1000 \
       --batch 4096 \
       --dim 5000 \
       --num-samples 300000 \

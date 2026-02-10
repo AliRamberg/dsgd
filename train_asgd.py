@@ -91,7 +91,7 @@ class ASGDParameterServer:
         return self.num_updates
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class ASGDWorker:
     def __init__(
         self, worker_id: int, ps, shard, cfg: TrainConfig, num_workers: int = 1
@@ -233,7 +233,7 @@ def run_asgd(
     ps = ASGDParameterServer.remote(
         cfg.d,
         cfg.lr,
-        cfg.device,
+        "cpu",
         eval_every=cfg.eval_every,
         num_workers=num_workers,
         batch_size=cfg.batch_size,
@@ -275,7 +275,8 @@ def run_asgd(
                 metrics.record_loss(update_count, loss, comm_bytes=0)
 
         # Final evaluation
-        eval_model = LinearModel(cfg.d).to(cfg.device)
+        eval_device = X_full.device
+        eval_model = LinearModel(cfg.d).to(eval_device)
         eval_model.load_state_dict(state_dict)
         eval_model.eval()
         with torch.no_grad():
@@ -288,7 +289,8 @@ def run_asgd(
         print(f"[ASGD] updates={final_updates} loss={final_loss:.5f}")
     else:
         state_dict = ray.get(ps.get_weights.remote())
-        eval_model = LinearModel(cfg.d).to(cfg.device)
+        eval_device = X_full.device
+        eval_model = LinearModel(cfg.d).to(eval_device)
         eval_model.load_state_dict(state_dict)
         eval_model.eval()
         with torch.no_grad():

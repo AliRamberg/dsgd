@@ -247,10 +247,11 @@ class PrometheusMetricCollector:
                 description="Run configuration metadata (info metric, always 1)",
                 tag_keys=info_tag_keys,
             )
-            info_tags = {k: str(v) for k, v in run_info.items()}
-            self.run_info_gauge.set(1, info_tags)
+            self._run_info_tags = {k: str(v) for k, v in run_info.items()}
+            self.run_info_gauge.set(1, self._run_info_tags)
         else:
             self.run_info_gauge = None
+            self._run_info_tags = None
 
         # Core metrics - always available
         self.loss_hist = Histogram(
@@ -408,6 +409,11 @@ class PrometheusMetricCollector:
         # Initialize core metrics to 0 so they appear in Prometheus immediately
         self.step_gauge.set(0, self.base_tags)
 
+    def _refresh_run_info(self):
+        """Re-set the run_info gauge so Prometheus sees a continuous series."""
+        if self.run_info_gauge is not None:
+            self.run_info_gauge.set(1, self._run_info_tags)
+
     def log_iteration(
         self, step: int, latency_ms: float, comm_bytes: int = 0, staleness: float = 0
     ):
@@ -424,10 +430,13 @@ class PrometheusMetricCollector:
         if staleness > 0:
             self.staleness_gauge.set(staleness, self.base_tags)
 
+        self._refresh_run_info()
+
     def log_loss(self, step: int, loss: float):
         """Log loss evaluation metrics."""
         self.step_gauge.set(step, self.base_tags)
         self.loss_hist.observe(loss, self.base_tags)
+        self._refresh_run_info()
 
     def log_staleness_stats(self, avg_staleness: float, max_staleness: float):
         """Log aggregated staleness statistics (ASGD/SSP)."""

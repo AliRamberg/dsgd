@@ -194,6 +194,7 @@ def main():
         batch_size=args.batch,
         total_updates=args.total_updates,
         device=device,
+        num_workers=args.num_workers,
         hetero_base=args.hetero_base,
         hetero_jitter=args.hetero_jitter,
         hetero_straggler_every=args.hetero_straggler_every,
@@ -221,6 +222,10 @@ def main():
     metrics = None
     if not args.no_logging:
         metrics = MetricsCollector(mode=args.mode, run_id=run_id)
+
+    # Log baseline loss (w=0) as step 0 so it always appears in charts
+    if metrics is not None and X is not None and y is not None:
+        metrics.record_loss(step=0, loss=base_loss)
 
     # Save config
     config_dict = {
